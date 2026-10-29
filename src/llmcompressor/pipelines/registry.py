@@ -37,6 +37,15 @@ class CalibrationPipeline(ABC, RegistryMixin):
         :return: CalibrationPipeline instance to be called with data (if not datafree)
         """
         user = standardize_lookup_name(user) if user else None
+        from llmcompressor.modifiers.osfp4 import OSFP4Modifier
+
+        if any(isinstance(modifier, OSFP4Modifier) for modifier in modifiers):
+            if len(modifiers) != 1:
+                raise ValueError("OSFP4 must be the only modifier in its recipe")
+            if user not in (None, "sequential", "independent"):
+                raise ValueError("OSFP4 requires the sequential calibration pipeline")
+            # oneshot defaults to independent; OSFP4 needs sequential propagation.
+            return cls.load_from_registry("sequential")
         inferred = standardize_lookup_name(cls._infer_pipeline(modifiers))
         independent = standardize_lookup_name("independent")
 

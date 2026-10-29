@@ -15,4 +15,14 @@ __all__ = [
     "ModifierFactory",
     "ModifierInterface",
     "Modifier",
+    "OSFP4Modifier",
 ]
+
+
+def __getattr__(name):
+    # Delay concrete modifier imports until core/lifecycle initialization finishes.
+    if name == "OSFP4Modifier":
+        from .osfp4 import OSFP4Modifier
+
+        return OSFP4Modifier
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
