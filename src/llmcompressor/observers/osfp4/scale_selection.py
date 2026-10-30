@@ -171,10 +171,8 @@ def _search_e4m3_gamma_star(
             1, winning_offsets[:, None]
         ).squeeze(1)
         gamma_w_final_flat[row_start:row_end] = gamma_w_final_tile
-        # Mark rows where no finite winning error was obtained.
         invalid_rows[row_start:row_end] = ~torch.isfinite(winning_errors)
 
-    # Return the selected scales and status flags for caller validation.
     return (
         gamma_w_final_flat.view(L, m, 1),
         invalid_rows,
