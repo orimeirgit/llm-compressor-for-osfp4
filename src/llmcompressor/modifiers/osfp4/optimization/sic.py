@@ -25,7 +25,6 @@ __all__ = [
     "optimize_sic",
 ]
 
-SIC_PRECISION = torch.float32
 _QUANTIZATION_GROUP_SIZE = 16
 
 
@@ -39,7 +38,7 @@ def make_empty_hessian(
     return torch.zeros(
         (n, n),
         device=device,
-        dtype=SIC_PRECISION,
+        dtype=torch.float32,
     )
 
 
@@ -49,7 +48,7 @@ def accumulate_hessian(
     gram_matrix: torch.Tensor,
 ) -> torch.Tensor:
     """Accumulate the raw FP32 activation Gram matrix ``X.T @ X``."""
-    X_rows = inp.to(device=gram_matrix.device, dtype=SIC_PRECISION).reshape(
+    X_rows = inp.to(device=gram_matrix.device, dtype=torch.float32).reshape(
         -1, inp.shape[-1]
     )
     gram_matrix.addmm_(X_rows.transpose(0, 1), X_rows)
