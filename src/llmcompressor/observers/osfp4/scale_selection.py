@@ -34,26 +34,7 @@ def _search_e4m3_gamma_star(
     gamma_w: torch.Tensor,
     weight_metric: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Select E4M3 weight scales with the lowest weighted reconstruction error.
-
-    Select one gamma_w_final per output channel in each block. Candidates must
-    satisfy the beta bounds relative to gamma_w. For positive, finite gamma_w
-    whose candidate interval lies outside the E4M3 range, allow the nearest
-    positive, finite boundary scale instead.
-
-    Args:
-        W_target_blocks: Target weights with shape [L, m, 16].
-        alpha: Input-channel scales with shape [L, 16].
-        gamma_w: Learned weight scales with shape [L, m, 1].
-        weight_metric: Input-channel error weights with shape [L, 16].
-
-    Returns:
-        gamma_w_final: Selected E4M3 scales with shape [L, m, 1].
-        invalid_rows: Boolean mask with shape [L * m], marking rows without
-            a finite winning error. The caller must reject these results.
-        fallback_used: Scalar boolean indicating whether any row used a
-            boundary scale outside the beta bounds.
-    """
+    """Select E4M3 weight scales that minimize weighted reconstruction error."""
     # Prepare weights, scales, and error weights for scoring in float32.
     L, m, _ = W_target_blocks.shape
     W_target_blocks = W_target_blocks.detach().to(dtype=torch.float32)
@@ -63,7 +44,7 @@ def _search_e4m3_gamma_star(
         device=W_target_blocks.device,
         dtype=torch.float32,
     )
-    # Collect all positive, finite E4M3 scales.
+
     C_scale = _get_e4m3_scale_grid(W_target_blocks.device, W_target_blocks.dtype)
 
     # Determine each row's allowed scale interval.
@@ -71,6 +52,7 @@ def _search_e4m3_gamma_star(
     gamma_w_flat = gamma_w.reshape(total_rows)
     gamma_lower = gamma_w_flat / _BETA_MAX
     gamma_upper = gamma_w_flat / _BETA_MIN
+
     # Include neighboring scales for boundary tolerance and fallback.
     candidate_starts = (
         torch.searchsorted(C_scale, gamma_lower, right=False)
@@ -82,7 +64,8 @@ def _search_e4m3_gamma_star(
         .add(1)
         .clamp(0, C_scale.numel())
     )
-    # Limit the number of rows scored together to control memory use.
+
+    # Limit the number of rows scored together.
     bytes_per_row = (
         _E4M3_MAX_CANDIDATES
         * _QUANTIZATION_GROUP_SIZE
@@ -137,8 +120,9 @@ def _search_e4m3_gamma_star(
             & ((beta >= beta_min) | torch.isclose(beta, beta_min))
             & ((beta <= beta_max) | torch.isclose(beta, beta_max))
         )
-        # Allow a boundary scale when the interval lies outside the E4M3 range.
-        # Zero, negative, and nonfinite learned scales remain invalid.
+
+        # Use the nearest E4M3 boundary scale for out-of-range intervals only when
+        # gamma_w is positive and finite.
         no_valid_candidates = ~valid.any(dim=-1)
         gamma_w_tile = gamma_w_flat[row_start:row_end]
         eligible = (
@@ -160,11 +144,13 @@ def _search_e4m3_gamma_star(
         W_target_tile = W_target_flat[row_start:row_end, None, :]
         quantized = FP4_E2M1_DATA.cast_to_fp4(W_target_tile / denominator)
         reconstructed = denominator * quantized
+
         # Measure reconstruction error using the weight metric.
         candidate_errors = (
             (W_target_tile - reconstructed).square() * tile_metric[:, None, :]
         ).sum(dim=-1)
         candidate_errors.masked_fill_(~valid, torch.inf)
+
         # Choose the lowest-error valid scale; ties favor the smaller scale.
         winning_errors, winning_offsets = candidate_errors.min(dim=-1)
         gamma_w_final_tile = gamma_candidates.gather(
