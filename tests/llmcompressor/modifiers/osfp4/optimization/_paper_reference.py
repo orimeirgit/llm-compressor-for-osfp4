@@ -134,7 +134,7 @@ def make_empty_hessian(
     module: Linear,
     device: torch.device | str | None = None,
 ) -> torch.Tensor:
-    """Allocate an FP32 raw input Gram matrix for an OSFP4 Linear module."""
+    """Allocate an FP32 Hessian matrix for an OSFP4 Linear module."""
     device = module.weight.device if device is None else device
     columns = module.weight.shape[1]
     return torch.zeros(
@@ -149,7 +149,7 @@ def accumulate_hessian(
     module: Linear,
     hessian: torch.Tensor,
 ) -> torch.Tensor:
-    """Accumulate the raw FP32 activation Gram matrix ``X.T @ X``."""
+    """Accumulate the FP32 Hessian matrix using ``X.T @ X``."""
     flat = inp.to(device=hessian.device, dtype=SIC_PRECISION).reshape(-1, inp.shape[-1])
     hessian.addmm_(flat.transpose(0, 1), flat)
     return hessian

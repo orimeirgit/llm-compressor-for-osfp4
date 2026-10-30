@@ -45,14 +45,14 @@ def make_empty_hessian(
 def accumulate_hessian(
     inp: torch.Tensor,
     module: Linear,
-    gram_matrix: torch.Tensor,
+    hessian: torch.Tensor,
 ) -> torch.Tensor:
-    """Accumulate the raw FP32 activation Gram matrix ``X.T @ X``."""
-    X_rows = inp.to(device=gram_matrix.device, dtype=torch.float32).reshape(
+    """Accumulate the FP32 Hessian matrix using ``X.T @ X``."""
+    X_rows = inp.to(device=hessian.device, dtype=torch.float32).reshape(
         -1, inp.shape[-1]
     )
-    gram_matrix.addmm_(X_rows.transpose(0, 1), X_rows)
-    return gram_matrix
+    hessian.addmm_(X_rows.transpose(0, 1), X_rows)
+    return hessian
 
 
 class SICQuantizationResult(NamedTuple):
@@ -110,7 +110,7 @@ def optimize_sic(
 
     Y = U @ W.transpose(0, 1)
     W_hat = torch.zeros_like(W)
-    for l in range(L - 1, -1, -1):  # noqa: E741
+    for l in range(L - 1, -1, -1):
         block_start = l * _QUANTIZATION_GROUP_SIZE
         block_end = block_start + _QUANTIZATION_GROUP_SIZE
 
