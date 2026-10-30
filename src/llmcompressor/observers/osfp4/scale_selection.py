@@ -8,6 +8,7 @@ from .fp4 import quantize_e2m1
 _QUANTIZATION_GROUP_SIZE = 16
 _BETA_MIN = 0.3
 _BETA_MAX = 1.2
+# At most 17 scales in the beta interval, plus two boundary neighbors.
 _E4M3_MAX_CANDIDATES = 19
 _E4M3_SEARCH_PRIMARY_TENSOR_BYTES = 64 * 1024 * 1024
 _E4M3_GRID_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
@@ -17,7 +18,7 @@ def _get_e4m3_scale_grid(
     device: torch.device | str,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Return every positive finite E4M3 value in ascending order."""
+    """Return C_scale, the positive finite E4M3 values in ascending order."""
     device = torch.device(device)
     key = (device, dtype)
     cached = _E4M3_GRID_CACHE.get(key)
@@ -29,34 +30,64 @@ def _get_e4m3_scale_grid(
 
 
 def _search_e4m3_gamma_star(
-    target: torch.Tensor,
+    W_target_blocks: torch.Tensor,
     alpha: torch.Tensor,
     gamma_w: torch.Tensor,
-    error_metric: torch.Tensor,
+    weight_metric: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Select E4M3 scales, clipping empty beta intervals to a finite boundary."""
-    # Prepare full-mapping tensors.
-    groups, rows, _ = target.shape
-    target = target.detach().to(dtype=torch.float32)
-    alpha = alpha.detach().to(device=target.device, dtype=torch.float32)
-    gamma_w = gamma_w.detach().to(device=target.device, dtype=torch.float32)
-    error_metric = error_metric.detach().to(
-        device=target.device,
+    """Select E4M3 weight scales with the lowest weighted reconstruction error.
+
+    Select one gamma_w_final per output channel in each block. Candidates must
+    satisfy the beta bounds relative to gamma_w. For positive, finite gamma_w
+    whose candidate interval lies outside the E4M3 range, allow the nearest
+    positive, finite boundary scale instead.
+
+    Args:
+        W_target_blocks: Target weights with shape [L, m, 16].
+        alpha: Input-channel scales with shape [L, 16].
+        gamma_w: Learned weight scales with shape [L, m, 1].
+        weight_metric: Input-channel error weights with shape [L, 16].
+
+    Returns:
+        gamma_w_final: Selected E4M3 scales with shape [L, m, 1].
+        invalid_rows: Boolean mask with shape [L * m], marking rows without
+            a finite winning error. The caller must reject these results.
+        fallback_used: Scalar boolean indicating whether any row used a
+            boundary scale outside the beta bounds.
+    """
+    # Prepare weights, scales, and error weights for scoring in float32.
+    L, m, _ = W_target_blocks.shape
+    W_target_blocks = W_target_blocks.detach().to(dtype=torch.float32)
+    alpha = alpha.detach().to(device=W_target_blocks.device, dtype=torch.float32)
+    gamma_w = gamma_w.detach().to(device=W_target_blocks.device, dtype=torch.float32)
+    weight_metric = weight_metric.detach().to(
+        device=W_target_blocks.device,
         dtype=torch.float32,
     )
-    grid = _get_e4m3_scale_grid(target.device, target.dtype)
+    # Collect all positive, finite E4M3 scales.
+    C_scale = _get_e4m3_scale_grid(W_target_blocks.device, W_target_blocks.dtype)
 
-    # Bound candidates and tile the scoring tensors.
-    total_rows = groups * rows
-    gamma_flat = gamma_w.reshape(total_rows)
-    lower = gamma_flat / _BETA_MAX
-    upper = gamma_flat / _BETA_MIN
-    starts = torch.searchsorted(grid, lower, right=False).sub(1).clamp(0, grid.numel())
-    ends = torch.searchsorted(grid, upper, right=True).add(1).clamp(0, grid.numel())
+    # Determine each row's allowed scale interval.
+    total_rows = L * m
+    gamma_w_flat = gamma_w.reshape(total_rows)
+    gamma_lower = gamma_w_flat / _BETA_MAX
+    gamma_upper = gamma_w_flat / _BETA_MIN
+    # Include neighboring scales for boundary tolerance and fallback.
+    candidate_starts = (
+        torch.searchsorted(C_scale, gamma_lower, right=False)
+        .sub(1)
+        .clamp(0, C_scale.numel())
+    )
+    candidate_ends = (
+        torch.searchsorted(C_scale, gamma_upper, right=True)
+        .add(1)
+        .clamp(0, C_scale.numel())
+    )
+    # Limit the number of rows scored together to control memory use.
     bytes_per_row = (
         _E4M3_MAX_CANDIDATES
         * _QUANTIZATION_GROUP_SIZE
-        * torch.tensor([], dtype=target.dtype).element_size()
+        * torch.tensor([], dtype=W_target_blocks.dtype).element_size()
     )
     rows_per_tile = max(
         1,
@@ -64,79 +95,89 @@ def _search_e4m3_gamma_star(
     )
     offsets = torch.arange(
         _E4M3_MAX_CANDIDATES,
-        device=target.device,
+        device=W_target_blocks.device,
     )
-    target_flat = target.reshape(
+    W_target_flat = W_target_blocks.reshape(
         total_rows,
         _QUANTIZATION_GROUP_SIZE,
     )
-    best_scales = torch.empty(
+    gamma_w_final_flat = torch.empty(
         total_rows,
-        device=target.device,
-        dtype=target.dtype,
+        device=W_target_blocks.device,
+        dtype=W_target_blocks.dtype,
     )
     invalid_rows = torch.empty(
         total_rows,
-        device=target.device,
+        device=W_target_blocks.device,
         dtype=torch.bool,
     )
-    beta_min = torch.tensor(_BETA_MIN, device=target.device)
-    beta_max = torch.tensor(_BETA_MAX, device=target.device)
-    fallback_used = torch.zeros((), device=target.device, dtype=torch.bool)
+    beta_min = torch.tensor(_BETA_MIN, device=W_target_blocks.device)
+    beta_max = torch.tensor(_BETA_MAX, device=W_target_blocks.device)
+    fallback_used = torch.zeros((), device=W_target_blocks.device, dtype=torch.bool)
 
-    for start in range(
+    for row_start in range(
         0,
         total_rows,
         rows_per_tile,
     ):
-        end = min(
-            start + rows_per_tile,
+        row_end = min(
+            row_start + rows_per_tile,
             total_rows,
         )
-        tile_starts = starts[start:end]
-        tile_ends = ends[start:end]
+        # Collect candidate scales for these rows.
+        tile_starts = candidate_starts[row_start:row_end]
+        tile_ends = candidate_ends[row_start:row_end]
         indices = tile_starts[:, None] + offsets[None, :]
         within_slice = indices < tile_ends[:, None]
-        indices = indices.clamp(max=grid.numel() - 1)
-        candidates = grid[indices]
-        beta = gamma_flat[start:end, None] / candidates
+        indices = indices.clamp(max=C_scale.numel() - 1)
+        gamma_candidates = C_scale[indices]
+        # Accept candidates within the beta bounds, including boundary tolerance.
+        beta = gamma_w_flat[row_start:row_end, None] / gamma_candidates
         valid = (
             within_slice
             & ((beta >= beta_min) | torch.isclose(beta, beta_min))
             & ((beta <= beta_max) | torch.isclose(beta, beta_max))
         )
-        # Relax the beta constraint only for empty intervals outside the grid.
-        # Invalid learned scales and nonfinite reconstruction errors still fail.
-        empty = ~valid.any(dim=-1)
-        tile_gamma = gamma_flat[start:end]
-        eligible = empty & torch.isfinite(tile_gamma) & (tile_gamma > 0)
-        below = eligible & (upper[start:end] < grid[0])
-        above = eligible & (lower[start:end] > grid[-1])
-        valid |= below[:, None] & (candidates == grid[0])
-        valid |= above[:, None] & (candidates == grid[-1])
+        # Allow a boundary scale when the interval lies outside the E4M3 range.
+        # Zero, negative, and nonfinite learned scales remain invalid.
+        no_valid_candidates = ~valid.any(dim=-1)
+        gamma_w_tile = gamma_w_flat[row_start:row_end]
+        eligible = (
+            no_valid_candidates & torch.isfinite(gamma_w_tile) & (gamma_w_tile > 0)
+        )
+        below = eligible & (gamma_upper[row_start:row_end] < C_scale[0])
+        above = eligible & (gamma_lower[row_start:row_end] > C_scale[-1])
+        valid |= below[:, None] & (gamma_candidates == C_scale[0])
+        valid |= above[:, None] & (gamma_candidates == C_scale[-1])
         fallback_used |= (below | above).any()
 
-        # Score in candidate order; min keeps the first tie.
-        # Flattened rows are group-major. Gather only this tile's repeated values.
-        group_indices = torch.arange(start, end, device=target.device) // rows
-        tile_alpha = alpha[group_indices]
-        tile_metric = error_metric[group_indices]
-        denominator = tile_alpha[:, None, :] * candidates[:, :, None]
-        original = target_flat[start:end, None, :]
-        quantized = quantize_e2m1(original / denominator)
-        reconstructed = denominator * quantized
-        errors = ((original - reconstructed).square() * tile_metric[:, None, :]).sum(
-            dim=-1
+        # Quantize and reconstruct the target weights with each candidate scale.
+        block_indices = (
+            torch.arange(row_start, row_end, device=W_target_blocks.device) // m
         )
-        errors.masked_fill_(~valid, torch.inf)
-        winning_errors, winning_offsets = errors.min(dim=-1)
-        tile_scales = candidates.gather(1, winning_offsets[:, None]).squeeze(1)
-        best_scales[start:end] = tile_scales
-        invalid_rows[start:end] = ~torch.isfinite(winning_errors)
+        tile_alpha = alpha[block_indices]
+        tile_metric = weight_metric[block_indices]
+        denominator = tile_alpha[:, None, :] * gamma_candidates[:, :, None]
+        W_target_tile = W_target_flat[row_start:row_end, None, :]
+        quantized = quantize_e2m1(W_target_tile / denominator)
+        reconstructed = denominator * quantized
+        # Measure reconstruction error using the weight metric.
+        candidate_errors = (
+            (W_target_tile - reconstructed).square() * tile_metric[:, None, :]
+        ).sum(dim=-1)
+        candidate_errors.masked_fill_(~valid, torch.inf)
+        # Choose the lowest-error valid scale; ties favor the smaller scale.
+        winning_errors, winning_offsets = candidate_errors.min(dim=-1)
+        gamma_w_final_tile = gamma_candidates.gather(
+            1, winning_offsets[:, None]
+        ).squeeze(1)
+        gamma_w_final_flat[row_start:row_end] = gamma_w_final_tile
+        # Mark rows where no finite winning error was obtained.
+        invalid_rows[row_start:row_end] = ~torch.isfinite(winning_errors)
 
-    # Restore the group/row layout.
+    # Return the selected scales and status flags for caller validation.
     return (
-        best_scales.view(groups, rows, 1),
+        gamma_w_final_flat.view(L, m, 1),
         invalid_rows,
         fallback_used,
     )

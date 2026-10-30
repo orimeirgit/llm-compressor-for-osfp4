@@ -23,7 +23,7 @@ def run_phases(
         weight_only=weight_only,
         optimization_input_batches=optimization_input_batches,
     )
-    scale = smoothing.deploy_mapping_smooth_quant_scale(mapping, result.alpha_star)
+    scale = smoothing.deploy_mapping_smooth_quant_scale(mapping, result.alpha)
     if not weight_only:
         osfp4_quantize.recalibrate_mapping_inputs(mapping, cache, scale)
     return osfp4_quantize.prepare_mapping_parameters(mapping, result)

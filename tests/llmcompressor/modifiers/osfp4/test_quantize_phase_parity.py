@@ -33,7 +33,8 @@ DEVICES = [
     pytest.param(
         "cuda",
         marks=pytest.mark.skipif(
-            not torch.cuda.is_available(), reason="CUDA unavailable"
+            not torch.get_device_module("cuda").is_available(),
+            reason="CUDA unavailable",
         ),
     ),
 ]
@@ -116,13 +117,20 @@ def test_mapping_phases_match_reference_bytes(mode, dtype, layout, policy, offlo
         )
         captured = []
         optimizer_name = "optimize_sic" if mode == "sic" else "optimize_rtn"
-        optimizer = getattr(osfp4_quantize, optimizer_name)
+        optimizer = getattr(
+            reference
+            if implementation is reference.quantize_mapping
+            else osfp4_quantize,
+            optimizer_name,
+        )
 
         def record(*args, **kwargs):
             result = optimizer(*args, **kwargs)
             captured.append(
                 {
-                    name: value.detach().clone()
+                    {"alpha_star": "alpha", "gamma_w_star": "gamma_w_final"}.get(
+                        name, name
+                    ): value.detach().clone()
                     for name, value in result._asdict().items()
                 }
             )

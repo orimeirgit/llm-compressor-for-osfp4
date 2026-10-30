@@ -103,12 +103,12 @@ def test_sic_quantizer_inputs_and_each_residual_update_match_bytes(
 
     class Observer:
         def optimize_quantization_group_scales(
-            self, value, *, weight_metric, activation_quantization_groups, alpha_dtype
+            self, value, *, weight_metric, X_blocks, alpha_dtype
         ):
             calls.append("optimize")
             assert_bytes(value, expected_groups)
             assert_bytes(weight_metric, metric)
-            assert activation_quantization_groups is None
+            assert X_blocks is None
             assert alpha_dtype == dtype
             return OptimizedQuantizationGroupScales(alpha, scales)
 
@@ -118,7 +118,7 @@ def test_sic_quantizer_inputs_and_each_residual_update_match_bytes(
             calls.append("select")
             selection_targets.append(value.clone())
             assert_bytes(weight_metric, metric[group : group + 1])
-            assert_bytes(optimized.alpha_star, alpha[group : group + 1])
+            assert_bytes(optimized.alpha, alpha[group : group + 1])
             assert_bytes(optimized.gamma_w, scales[group : group + 1])
             return scales[group : group + 1], zero_points[group : group + 1]
 
@@ -167,8 +167,8 @@ def test_sic_quantizer_inputs_and_each_residual_update_match_bytes(
             assert_bytes(after, Y[:j, :])
             index += 1
     assert_bytes(result.quantized_weight, W_hat)
-    assert_bytes(result.alpha_star, alpha.reshape(columns))
-    assert_bytes(result.gamma_w_star, scales.squeeze(-1).transpose(0, 1).contiguous())
+    assert_bytes(result.alpha, alpha.reshape(columns))
+    assert_bytes(result.gamma_w_final, scales.squeeze(-1).transpose(0, 1).contiguous())
     assert_bytes(
         result.weight_zero_point,
         zero_points.squeeze(-1).transpose(0, 1).float().contiguous(),

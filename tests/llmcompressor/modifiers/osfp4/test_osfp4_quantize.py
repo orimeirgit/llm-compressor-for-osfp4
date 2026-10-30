@@ -72,8 +72,8 @@ def test_mapping_phases_reuse_attached_observer(
         balance_layers=(layer,),
     )
     result = SICQuantizationResult(
-        alpha_star=torch.ones(16),
-        gamma_w_star=torch.ones(2, 1),
+        alpha=torch.ones(16),
+        gamma_w_final=torch.ones(2, 1),
         weight_zero_point=torch.zeros(2, 1),
         quantized_weight=torch.zeros(2, 16),
     )
@@ -146,7 +146,7 @@ def test_mapping_phases_reuse_attached_observer(
     if offloaded:
         assert isinstance(layer._parameters, OffloadCache)
     assert torch.equal(
-        qparams["weight_scale"], result.gamma_w_star.to(layer.weight_scale)
+        qparams["weight_scale"], result.gamma_w_final.to(layer.weight_scale)
     )
     assert torch.equal(
         qparams["weight_zero_point"],
@@ -216,8 +216,8 @@ def test_mapping_phases_return_fused_row_slices(monkeypatch, mode):
     weight_zero_point = torch.arange(5, dtype=torch.float32).reshape(5, 1)
     quantized_weight = torch.arange(80, dtype=torch.float32).reshape(5, 16)
     result = SICQuantizationResult(
-        alpha_star=torch.ones(16),
-        gamma_w_star=weight_scale,
+        alpha=torch.ones(16),
+        gamma_w_final=weight_scale,
         weight_zero_point=weight_zero_point,
         quantized_weight=quantized_weight,
     )

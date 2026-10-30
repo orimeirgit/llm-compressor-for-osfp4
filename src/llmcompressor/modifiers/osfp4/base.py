@@ -483,7 +483,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         result: RTNQuantizationResult | SICQuantizationResult,
     ) -> None:
         try:
-            scale = deploy_mapping_smooth_quant_scale(mapping, result.alpha_star)
+            scale = deploy_mapping_smooth_quant_scale(mapping, result.alpha)
             if not self._weight_only:
                 recalibrate_mapping_inputs(mapping, self._calibration, scale)
             deployment = prepare_mapping_parameters(mapping, result)

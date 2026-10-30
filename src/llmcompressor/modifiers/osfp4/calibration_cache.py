@@ -20,8 +20,10 @@ class OSFP4CalibrationCache:
     offload_hessians: bool = False
     inputs: dict[str, list[torch.Tensor]] = field(default_factory=dict)
     events: dict[str, dict[torch.device, torch.Event]] = field(default_factory=dict)
-    hessian: dict[str, torch.Tensor] = field(default_factory=dict)  # SIC statistic
-    sigma_x_squared: dict[str, torch.Tensor] = field(default_factory=dict)  # RTN
+    # Raw sum of x @ x.T; divide by sample_count for Sigma_X (SIC).
+    hessian: dict[str, torch.Tensor] = field(default_factory=dict)
+    # Raw per-channel squared sums; normalize before RTN optimization.
+    sigma_x_squared: dict[str, torch.Tensor] = field(default_factory=dict)
     sample_count: dict[str, int] = field(default_factory=dict)
     capture_streams: dict[torch.device, torch.Stream] = field(default_factory=dict)
     sample_indices: dict[str, torch.Tensor] = field(default_factory=dict)

@@ -140,7 +140,7 @@ def prepare_mapping_parameters(
         qparams: dict[str, torch.Tensor] = {}
         if quantized_weight is not None:
             qparams["weight"] = quantized_weight[row_start:row_end].to(layer.weight)
-        qparams["weight_scale"] = result.gamma_w_star[row_start:row_end].to(
+        qparams["weight_scale"] = result.gamma_w_final[row_start:row_end].to(
             layer.weight_scale
         )
         qparams["weight_zero_point"] = result.weight_zero_point[row_start:row_end].to(

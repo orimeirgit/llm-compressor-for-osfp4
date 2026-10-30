@@ -26,7 +26,8 @@ _FP8_SAFETY_FACTOR = 2.0
 
 
 class QuantizationGroupScaleValues(NamedTuple):
-    """Positive scales with alpha ``[groups, 16]`` and per-group gammas."""
+    """Positive scales: alpha ``[L, 16]``, gamma_w ``[L, m, 1]``,
+    and optional gamma_x ``[L, 1, k]``."""
 
     alpha: torch.Tensor
     gamma_w: torch.Tensor
@@ -45,17 +46,17 @@ class LogScaleParameters(NamedTuple):
 
 
 def initialize_scale_values_from_absmax(
-    target: torch.Tensor,
-    activations: torch.Tensor | None,
+    W_blocks: torch.Tensor,
+    X_blocks: torch.Tensor | None,
 ) -> QuantizationGroupScaleValues:
-    """Initialize alpha and gamma scales from quantization-group absolute maxima."""
+    """Initialize alpha, gamma_w, and optional gamma_x from block absolute maxima."""
 
     def normalize(
         values: torch.Tensor,
         target_absmax: float,
         eps: float = 1e-12,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Normalize each quantization group and return its divisor."""
+        """Normalize each block and return its divisor."""
         divisors = torch.clamp(
             values.abs().amax(dim=(1, 2), keepdim=True) / target_absmax,
             min=eps,
@@ -74,30 +75,30 @@ def initialize_scale_values_from_absmax(
         )
         return maxima / FP4_ABSMAX
 
-    groups, _, width = target.shape
+    L, _, block_width = W_blocks.shape
     alpha = torch.ones(
-        groups,
-        width,
-        device=target.device,
-        dtype=target.dtype,
+        L,
+        block_width,
+        device=W_blocks.device,
+        dtype=W_blocks.dtype,
     )
     target_absmax = FP4_ABSMAX * _FP8_MAX / _FP8_SAFETY_FACTOR
-    normalized_target, weight_divisor = normalize(
-        target,
+    W_blocks_normalized, weight_divisor = normalize(
+        W_blocks,
         target_absmax,
     )
     gamma_w = weight_divisor * absmax_divisor(
-        normalized_target / alpha.view(groups, 1, -1),
+        W_blocks_normalized / alpha.view(L, 1, -1),
         reduction_dim=2,
     )
     gamma_x = None
-    if activations is not None:
-        normalized_activations, activation_divisor = normalize(
-            activations,
+    if X_blocks is not None:
+        X_blocks_normalized, activation_divisor = normalize(
+            X_blocks,
             target_absmax,
         )
         gamma_x = activation_divisor * absmax_divisor(
-            normalized_activations * alpha.view(groups, -1, 1),
+            X_blocks_normalized * alpha.view(L, -1, 1),
             reduction_dim=1,
         )
     return QuantizationGroupScaleValues(
@@ -124,7 +125,7 @@ def create_log_scale_parameters(
 
 
 def run_optimizer(
-    parameters: LogScaleParameters,
+    log_scales: LogScaleParameters,
     loss_evaluator: Callable[[], torch.Tensor],
     *,
     steps: int,
@@ -132,7 +133,7 @@ def run_optimizer(
 ) -> None:
     """Optimize log scales."""
     optimizer = torch.optim.Adam(
-        [parameter for parameter in parameters if parameter is not None],
+        [parameter for parameter in log_scales if parameter is not None],
         lr=lr,
     )
     with torch.enable_grad():
@@ -146,29 +147,29 @@ def run_optimizer(
 # Canonicalization
 
 
-def canonicalize_log_scale_parameters(parameters: LogScaleParameters) -> None:
-    """Center log weight gamma and fold its mean into alpha in place."""
+def canonicalize_log_scale_parameters(log_scales: LogScaleParameters) -> None:
+    """Center log_gamma_w and fold its mean into log_alpha in place."""
     with torch.no_grad():
-        shift = parameters.log_gamma_w.mean(dim=(1, 2), keepdim=True)
-        parameters.log_alpha.add_(shift.squeeze(-1))
-        parameters.log_gamma_w.sub_(shift)
-        if parameters.log_gamma_x is not None:
-            parameters.log_gamma_x.add_(shift)
+        mean_log_gamma_w = log_scales.log_gamma_w.mean(dim=(1, 2), keepdim=True)
+        log_scales.log_alpha.add_(mean_log_gamma_w.squeeze(-1))
+        log_scales.log_gamma_w.sub_(mean_log_gamma_w)
+        if log_scales.log_gamma_x is not None:
+            log_scales.log_gamma_x.add_(mean_log_gamma_w)
 
 
 # Materialization
 
 
 def materialize_scale_values(
-    parameters: LogScaleParameters,
+    log_scales: LogScaleParameters,
 ) -> QuantizationGroupScaleValues:
     """Return detached positive scales without mutating the optimized parameters."""
     return QuantizationGroupScaleValues(
-        alpha=parameters.log_alpha.detach().exp(),
-        gamma_w=parameters.log_gamma_w.detach().exp(),
+        alpha=log_scales.log_alpha.detach().exp(),
+        gamma_w=log_scales.log_gamma_w.detach().exp(),
         gamma_x=(
             None
-            if parameters.log_gamma_x is None
-            else parameters.log_gamma_x.detach().exp()
+            if log_scales.log_gamma_x is None
+            else log_scales.log_gamma_x.detach().exp()
         ),
     )

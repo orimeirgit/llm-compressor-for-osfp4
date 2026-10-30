@@ -15,10 +15,10 @@ import torch
 from torch.nn import Module
 
 from llmcompressor.modifiers.osfp4.calibration_cache import OSFP4CalibrationCache
-from llmcompressor.modifiers.osfp4.optimization import optimize_rtn, optimize_sic
 from llmcompressor.modifiers.quantization.calibration import update_qparams
 
 from ._smoothing_reference import deploy_mapping_smooth_quant_scale
+from .optimization._paper_reference import optimize_rtn, optimize_sic
 
 if TYPE_CHECKING:
     from llmcompressor.modifiers.osfp4.base import OSFP4Mapping

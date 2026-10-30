@@ -22,7 +22,7 @@ def assemble_activation_quantization_groups(
         batch.numel() // (quantization_group_count * _QUANTIZATION_GROUP_SIZE)
         for batch in cached_activation_batches
     )
-    groups = torch.empty(
+    X_blocks = torch.empty(
         quantization_group_count,
         _QUANTIZATION_GROUP_SIZE,
         sample_count,
@@ -46,8 +46,8 @@ def assemble_activation_quantization_groups(
             .permute(1, 2, 0)
         )
         end = start + converted.shape[-1]
-        groups[:, :, start:end].copy_(converted)
+        X_blocks[:, :, start:end].copy_(converted)
         start = end
         # Release this transfer before allocating the next batch's FP32 buffer.
         del converted
-    return groups
+    return X_blocks
