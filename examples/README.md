@@ -14,7 +14,6 @@ Some examples are additionally grouped by model type, such as:
 Other examples are grouped by algorithm, such as:
 - `awq`
 - `autoround`
-- [`osfp4`](osfp4/README.md): joint NVFP4 smoothing and block-scale optimization
 
 ## How to find the right example
 

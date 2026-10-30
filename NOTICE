@@ -70,16 +70,3 @@ Sample audio is provided under a Creative Commons Attribution License https://cr
 ```
 
 Other external dependencies, if referenced in this repository's various subdirectories, are subject to their associated licenses and terms.
-
-OSFP4 attribution
-=================
-
-The OSFP4 modifier, observer, numerical routines and reference tests are adapted
-from https://github.com/neriahbd/OSFP4 at commit
-21e069ca80468fa9c44c82aa4e1378531a897c42, licensed under Apache-2.0.
-That project extracted its implementation from
-https://github.com/neriahbd/llmcompressor-osfp4 in commit
-9ef44493d327c76d11aa4614898a35ba0e8e160f.
-Its smoothing mapping resolver was adapted from LLM Compressor SmoothQuant.
-This integration changes package imports, lifecycle validation and checkpoint
-serialization to use compressed-tensors diagonal transforms.
