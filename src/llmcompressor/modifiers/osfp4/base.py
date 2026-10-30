@@ -15,6 +15,7 @@ from compressed_tensors.quantization import (
     QuantizationStrategy,
     preset_name_to_scheme,
 )
+from compressed_tensors.registry import standardize_lookup_name
 from compressed_tensors.utils import (
     match_modules_set,
     match_named_modules,
@@ -104,8 +105,19 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         self._require_usable()
         if is_distributed():
             raise NotImplementedError("OSFP4 calibration is single-process")
-        if kwargs.get("pipeline") not in (None, "sequential", "independent"):
+        pipeline = kwargs.get("pipeline")
+        if pipeline is not None and standardize_lookup_name(pipeline) not in (
+            "sequential",
+            "independent",
+        ):
             raise ValueError("OSFP4 requires the sequential calibration pipeline")
+        if getattr(state, "layerwise_decompression", False) or getattr(
+            state, "layerwise_compression", False
+        ):
+            raise ValueError(
+                "OSFP4 does not support layerwise compression or decompression; "
+                "calibrate from an uncompressed model"
+            )
         recipe = active_session().lifecycle.recipe
         if recipe is not None and any(m is self for m in recipe.modifiers):
             if len(recipe.modifiers) != 1:

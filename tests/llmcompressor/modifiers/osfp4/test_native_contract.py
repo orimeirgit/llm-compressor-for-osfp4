@@ -9,6 +9,7 @@ from llmcompressor.core import Event, State, create_session
 from llmcompressor.modifiers import ModifierFactory, OSFP4Modifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.pipelines import CalibrationPipeline
+from llmcompressor.pipelines.independent.pipeline import IndependentPipeline
 from llmcompressor.pipelines.sequential import SequentialPipeline
 
 from ._testing import LlamaForCausalLM, make_osfp4_modifier, run_modifier
@@ -40,13 +41,35 @@ def test_factory_discovers_modifier_without_external_plugin():
 @pytest.mark.parametrize("pipeline", [None, "sequential", "independent"])
 def test_pipeline_selection(pipeline):
     selected = CalibrationPipeline.from_modifiers([make_osfp4_modifier()], pipeline)
-    assert isinstance(selected, SequentialPipeline)
+    expected = IndependentPipeline if pipeline == "independent" else SequentialPipeline
+    assert isinstance(selected, expected)
+
+
+@pytest.mark.parametrize("pipeline", ["Sequential", "INDEPENDENT"])
+def test_pipeline_name_is_standardized(pipeline):
+    with create_session() as session:
+        session.initialize(
+            model=LlamaForCausalLM(),
+            recipe=[make_osfp4_modifier()],
+            pipeline=pipeline,
+        )
 
 
 @pytest.mark.parametrize("pipeline", ["basic", "datafree"])
 def test_unsupported_pipeline_rejected(pipeline):
-    with pytest.raises(ValueError, match="sequential"):
-        CalibrationPipeline.from_modifiers([make_osfp4_modifier()], pipeline)
+    with create_session() as session, pytest.raises(ValueError, match="sequential"):
+        session.initialize(
+            model=LlamaForCausalLM(),
+            recipe=[make_osfp4_modifier()],
+            pipeline=pipeline,
+        )
+
+
+@pytest.mark.parametrize("flag", ["layerwise_decompression", "layerwise_compression"])
+def test_layerwise_modes_rejected(flag):
+    with create_session() as session, pytest.raises(ValueError, match="layerwise"):
+        setattr(session.state, flag, True)
+        session.initialize(model=LlamaForCausalLM(), recipe=[make_osfp4_modifier()])
 
 
 def test_composition_rejected_before_quantization():
