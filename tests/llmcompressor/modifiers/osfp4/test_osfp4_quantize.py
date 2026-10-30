@@ -374,3 +374,25 @@ def test_weight_only_uses_statistics_without_activation_replay(monkeypatch, mode
     for layer in model.modules():
         if hasattr(layer, "weight_scale"):
             assert not hasattr(layer, "input_global_scale")
+
+
+@pytest.mark.parametrize("smooth_in_features", [8, 6])
+def test_linear_smooth_layer_folding_preserves_output(smooth_in_features):
+    from llmcompressor.modifiers.osfp4.smoothing import (
+        deploy_mapping_smooth_quant_scale,
+    )
+
+    torch.manual_seed(0)
+    smooth = torch.nn.Linear(smooth_in_features, 8, bias=True)
+    balance = torch.nn.Linear(8, 4, bias=False)
+    x = torch.randn(3, smooth_in_features)
+    expected = balance(smooth(x))
+    mapping = OSFP4Mapping(
+        mapping_name="smooth",
+        smooth_layer=smooth,
+        balance_layers=(balance,),
+    )
+
+    deploy_mapping_smooth_quant_scale(mapping, torch.rand(8) + 0.5)
+
+    torch.testing.assert_close(balance(smooth(x)), expected)

@@ -46,7 +46,8 @@ def _deploy_smooth_layer_smoothing(
 
     scale = deployed_scale.to(smooth_layer.weight)
     weight = smooth_layer.weight.detach().clone()
-    weight[:input_width] *= scale
+    # Scale output rows: a norm weight is 1-D, a Linear weight is [out, in].
+    weight[:input_width] *= scale if weight.ndim == 1 else scale.view(-1, 1)
     update_offload_parameter(smooth_layer, "weight", weight)
 
     if getattr(smooth_layer, "bias", None) is not None:
