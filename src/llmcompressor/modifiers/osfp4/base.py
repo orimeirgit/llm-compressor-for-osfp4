@@ -40,7 +40,13 @@ from llmcompressor.utils.pytorch.module import get_module_to_name_dict
 
 from .activation_subsampling import subsample_activations
 from .calibration_cache import OSFP4CalibrationCache
-from .osfp4_quantize import quantize_mapping
+from .optimization import RTNQuantizationResult, SICQuantizationResult
+from .osfp4_quantize import (
+    optimize_mapping,
+    prepare_mapping_parameters,
+    recalibrate_mapping_inputs,
+)
+from .smoothing import deploy_mapping_smooth_quant_scale
 from .transforms import initialize_diagonal_smoothing
 
 __all__ = ["OSFP4Mapping", "OSFP4Modifier"]
@@ -86,7 +92,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
     )
     _optimized_mapping_names: set[str] = PrivateAttr(default_factory=set)
     _finalization_complete: bool = PrivateAttr(default=False)
-    _deployment_failure: tuple[str, str] | None = PrivateAttr(default=None)
+    _deployment_failure: str | None = PrivateAttr(default=None)
     _weight_only: bool = PrivateAttr(default=False)
     _activation_subsampling_records: dict[str, dict[str, int | str]] = PrivateAttr(
         default_factory=dict
@@ -135,7 +141,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
             )
         ):
             raise ValueError("OSFP4 initially supports dense models only")
-            
+
         self._resolved_mappings = self._resolve_mappings(state.model)
         self._reset_calibration_state()
         # State may contain a deep copy; count the loader the pipeline will consume.
@@ -416,7 +422,15 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         if mapping.mapping_name in self._optimized_mapping_names:
             return
         optimization_input_batches = self._sample_optimization_inputs(mapping)
-        self._deploy_mapping(mapping, optimization_input_batches)
+        result = optimize_mapping(
+            mapping,
+            self._calibration,
+            mode=self.optimization_mode,
+            dampening_frac=self.dampening_frac,
+            weight_only=self._weight_only,
+            optimization_input_batches=optimization_input_batches,
+        )
+        self._deploy_mapping(mapping, result)
         self._optimized_mapping_names.add(mapping.mapping_name)
         self._calibration.clear_mapping(mapping.mapping_name)
 
@@ -466,34 +480,20 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
     def _deploy_mapping(
         self,
         mapping: OSFP4Mapping,
-        optimization_input_batches: tuple[torch.Tensor, ...] | None,
+        result: RTNQuantizationResult | SICQuantizationResult,
     ) -> None:
-        stage = None
-
-        def deployment_stage(value: str) -> None:
-            nonlocal stage
-            stage = value
-
         try:
-            deployment = quantize_mapping(
-                mapping,
-                self._calibration,
-                mode=self.optimization_mode,
-                dampening_frac=self.dampening_frac,
-                weight_only=self._weight_only,
-                optimization_input_batches=optimization_input_batches,
-                _deployment_stage=deployment_stage,
-            )
-            deployment_stage("parameter installation")
+            scale = deploy_mapping_smooth_quant_scale(mapping, result.alpha_star)
+            if not self._weight_only:
+                recalibrate_mapping_inputs(mapping, self._calibration, scale)
+            deployment = prepare_mapping_parameters(mapping, result)
             for layer, qparams in deployment:
                 for name, value in qparams.items():
                     update_offload_parameter(layer, name, value)
         except BaseException as error:
-            if stage is not None:
-                # No rollback: even a failed first write may have changed offload state.
-                self._deployment_failure = (mapping.mapping_name, stage)
-                raise RuntimeError(self._deployment_failure_message()) from error
-            raise
+            # No rollback: even a failed first write may have changed offload state.
+            self._deployment_failure = mapping.mapping_name
+            raise RuntimeError(self._deployment_failure_message()) from error
 
     # 4. Calibration completion: remove hooks, verify coverage, and freeze quantization.
 
@@ -542,9 +542,8 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
 
     def _deployment_failure_message(self) -> str:
         assert self._deployment_failure is not None
-        name, stage = self._deployment_failure
         return (
-            f"OSFP4 deployment failed for mapping {name!r} during {stage}; "
+            f"OSFP4 deployment failed for mapping {self._deployment_failure!r}; "
             "the model may be partially modified. Reload a fresh model and create "
             "a fresh OSFP4Modifier; this modifier cannot be retried."
         )

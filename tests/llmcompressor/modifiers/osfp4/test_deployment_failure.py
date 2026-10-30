@@ -15,7 +15,9 @@ from ._testing import LlamaForCausalLM, make_osfp4_modifier
 @pytest.mark.parametrize("mode", ["rtn", "sic"])
 @pytest.mark.parametrize("scheme", ["NVFP4", "NVFP4A16"])
 @pytest.mark.parametrize("runtime", [False, True])
-@pytest.mark.parametrize("stage", ["smoothing", "replay", "installation"])
+@pytest.mark.parametrize(
+    "stage", ["smoothing", "replay", "preparation", "installation"]
+)
 def test_partial_deployment_requires_fresh_model_and_modifier(
     monkeypatch, mode, scheme, runtime, stage
 ):
@@ -57,6 +59,12 @@ def test_partial_deployment_requires_fresh_model_and_modifier(
                 "_update_smoothed_input_global_scale",
                 after_write(osfp4_quantize._update_smoothed_input_global_scale),
             )
+        elif stage == "preparation":
+            patch.setattr(
+                base,
+                "prepare_mapping_parameters",
+                after_write(base.prepare_mapping_parameters),
+            )
         elif stage == "installation":
             patch.setattr(
                 base,
@@ -66,6 +74,7 @@ def test_partial_deployment_requires_fresh_model_and_modifier(
         with pytest.raises(RuntimeError, match="Reload a fresh model") as raised:
             modifier._optimize_mapping(mapping)
     assert raised.value.__cause__ is error
+    assert modifier._deployment_failure == mapping.mapping_name
     assert not torch.equal(first_weight, mapping.balance_layers[0].weight)
     assert mapping.mapping_name not in modifier._optimized_mapping_names
     assert modifier._calibration.has_observation(mapping.mapping_name)

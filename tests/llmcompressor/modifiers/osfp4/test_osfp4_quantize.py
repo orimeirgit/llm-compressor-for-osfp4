@@ -12,14 +12,19 @@ from llmcompressor.core import Event, State
 from llmcompressor.modifiers.osfp4 import OSFP4Modifier
 from llmcompressor.modifiers.osfp4.base import OSFP4Mapping
 from llmcompressor.modifiers.osfp4.calibration_cache import OSFP4CalibrationCache
-from llmcompressor.modifiers.osfp4.osfp4_quantize import quantize_mapping
+from llmcompressor.modifiers.osfp4.optimization import (
+    RTNQuantizationResult,
+    SICQuantizationResult,
+)
+from llmcompressor.modifiers.osfp4.osfp4_quantize import optimize_mapping
 from llmcompressor.modifiers.osfp4.transforms import initialize_diagonal_smoothing
 
+from ._quantize_phases import run_phases
 from ._testing import LlamaForCausalLM, run_modifier
 
 
-def test_quantize_mapping_signature_has_no_optimizer_or_batch_controls():
-    parameters = inspect.signature(quantize_mapping).parameters
+def test_optimize_mapping_signature_has_no_optimizer_or_batch_controls():
+    parameters = inspect.signature(optimize_mapping).parameters
 
     assert "steps" not in parameters
     assert "lr" not in parameters
@@ -50,7 +55,7 @@ def _prepared_layer(mode, dtype=torch.float32, weight_only=False):
 @pytest.mark.parametrize("activation_policy", ["full", "sampled", "weight_only"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("offloaded", [False, True])
-def test_quantize_mapping_reuses_attached_observer(
+def test_mapping_phases_reuse_attached_observer(
     monkeypatch, mode, runtime, activation_policy, dtype, offloaded
 ):
     from llmcompressor.modifiers.osfp4 import osfp4_quantize
@@ -66,12 +71,14 @@ def test_quantize_mapping_reuses_attached_observer(
         smooth_layer=None if runtime else torch.nn.LayerNorm(16),
         balance_layers=(layer,),
     )
-    result = SimpleNamespace(
+    result = SICQuantizationResult(
         alpha_star=torch.ones(16),
         gamma_w_star=torch.ones(2, 1),
         weight_zero_point=torch.zeros(2, 1),
         quantized_weight=torch.zeros(2, 16),
     )
+    if mode == "rtn":
+        result = RTNQuantizationResult(*result[:3])
     seen = {}
     events = []
 
@@ -106,7 +113,7 @@ def test_quantize_mapping_reuses_attached_observer(
     monkeypatch.setattr(cache, "wait", wait)
     sampled = (torch.full((2, 16), 2.0),) if activation_policy == "sampled" else None
 
-    deployment = quantize_mapping(
+    deployment = run_phases(
         mapping,
         cache,
         mode=mode,
@@ -190,7 +197,7 @@ def test_optimization_only_uses_sampled_activations(monkeypatch, mode):
 
 
 @pytest.mark.parametrize("mode", ["rtn", "sic"])
-def test_quantize_mapping_returns_fused_row_slices(monkeypatch, mode):
+def test_mapping_phases_return_fused_row_slices(monkeypatch, mode):
     from llmcompressor.modifiers.osfp4 import osfp4_quantize
 
     layers = (torch.nn.Linear(16, 3), torch.nn.Linear(16, 2))
@@ -208,20 +215,21 @@ def test_quantize_mapping_returns_fused_row_slices(monkeypatch, mode):
     weight_scale = torch.arange(5, dtype=torch.float32).reshape(5, 1) + 0.5
     weight_zero_point = torch.arange(5, dtype=torch.float32).reshape(5, 1)
     quantized_weight = torch.arange(80, dtype=torch.float32).reshape(5, 16)
-    result = SimpleNamespace(
+    result = SICQuantizationResult(
         alpha_star=torch.ones(16),
         gamma_w_star=weight_scale,
         weight_zero_point=weight_zero_point,
         quantized_weight=quantized_weight,
     )
+    if mode == "rtn":
+        result = RTNQuantizationResult(*result[:3])
     monkeypatch.setattr(
         osfp4_quantize,
         "optimize_sic" if mode == "sic" else "optimize_rtn",
         lambda *_args, **_kwargs: result,
     )
     monkeypatch.setattr(
-        osfp4_quantize,
-        "deploy_mapping_smooth_quant_scale",
+        "llmcompressor.modifiers.osfp4.smoothing.deploy_mapping_smooth_quant_scale",
         lambda _mapping, scale: scale,
     )
     monkeypatch.setattr(
@@ -236,7 +244,7 @@ def test_quantize_mapping_returns_fused_row_slices(monkeypatch, mode):
         sample_count={"mapping": 1},
     )
 
-    deployment = quantize_mapping(
+    deployment = run_phases(
         mapping,
         cache,
         mode=mode,

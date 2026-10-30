@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from compressed_tensors.offload import update_offload_parameter
-from torch.nn import Linear, Module, Parameter
+from torch.nn import Linear, Module
 
 from .transforms import TRANSFORM_MODULE
 
@@ -24,8 +24,10 @@ def deploy_mapping_smooth_quant_scale(
     """Deploy smooth-layer or runtime smoothing and return the FP32 scale."""
     balance_layers = mapping.balance_layers
     scale = scale.reshape(-1).to(device=balance_layers[0].weight.device)
+
     if mapping.requires_runtime_smoothing:
-        return _deploy_runtime_smoothing(balance_layers[0], scale).detach().float()
+        return _deploy_runtime_smoothing(balance_layers[0], scale)
+
     return _deploy_smooth_layer_smoothing(mapping.smooth_layer, balance_layers, scale)
 
 
@@ -36,17 +38,17 @@ def _deploy_smooth_layer_smoothing(
 ) -> torch.Tensor:
     """Balance weights and fold the scale into the preceding smooth layer."""
     input_width = balance_layers[0].weight.shape[1]
-    # Round through the first balance layer's dtype before updating any layer.
     deployed_scale = scale.to(balance_layers[0].weight).float()
+    # Divide each balance layer's weight columns by the scale.
     for layer in balance_layers:
         scale = deployed_scale.to(layer.weight)
         weight = layer.weight.detach().clone()
         weight[:, :input_width] /= scale.view(1, -1)
         update_offload_parameter(layer, "weight", weight)
 
+    # Multiply norm weights and bias (or Linear output rows and bias) by the scale.
     scale = deployed_scale.to(smooth_layer.weight)
     weight = smooth_layer.weight.detach().clone()
-    # Scale output rows: a norm weight is 1-D, a Linear weight is [out, in].
     weight[:input_width] *= scale if weight.ndim == 1 else scale.view(-1, 1)
     update_offload_parameter(smooth_layer, "weight", weight)
 
@@ -54,16 +56,17 @@ def _deploy_smooth_layer_smoothing(
         bias = smooth_layer.bias.detach().clone()
         bias[:input_width] *= scale
         update_offload_parameter(smooth_layer, "bias", bias)
+
     return deployed_scale
 
 
-def _deploy_runtime_smoothing(layer: Linear, scale: torch.Tensor) -> Parameter:
-    """Deploy and return a canonical BF16 runtime smoothing scale."""
+def _deploy_runtime_smoothing(layer: Linear, scale: torch.Tensor) -> torch.Tensor:
+    """Store the BF16 scale in osfp4_input.weight and return its FP32 values."""
     deployed_scale = scale.detach().float().to(torch.bfloat16)
     transform = getattr(layer, TRANSFORM_MODULE)
     transform.set_scale(deployed_scale)
     weight = layer.weight.detach().clone()
-    weight /= deployed_scale.float().to(weight).view(1, -1)
+    weight /= deployed_scale.to(weight).view(1, -1)
     update_offload_parameter(layer, "weight", weight)
 
-    return transform.weight
+    return transform.weight.detach().float()

@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -14,13 +13,21 @@ from torch.nn import Module
 from llmcompressor.modifiers.quantization.calibration import update_qparams
 
 from .calibration_cache import OSFP4CalibrationCache
-from .optimization import optimize_rtn, optimize_sic
-from .smoothing import deploy_mapping_smooth_quant_scale
+from .optimization import (
+    RTNQuantizationResult,
+    SICQuantizationResult,
+    optimize_rtn,
+    optimize_sic,
+)
 
 if TYPE_CHECKING:
     from .base import OSFP4Mapping
 
-__all__ = ["quantize_mapping"]
+__all__ = [
+    "optimize_mapping",
+    "recalibrate_mapping_inputs",
+    "prepare_mapping_parameters",
+]
 
 
 def _update_smoothed_input_global_scale(
@@ -45,7 +52,7 @@ def _update_smoothed_input_global_scale(
     update_qparams(layers, "input")
 
 
-def quantize_mapping(
+def optimize_mapping(
     mapping: OSFP4Mapping,
     cache: OSFP4CalibrationCache,
     *,
@@ -53,9 +60,8 @@ def quantize_mapping(
     dampening_frac: float,
     weight_only: bool,
     optimization_input_batches: tuple[torch.Tensor, ...] | None = None,
-    _deployment_stage: Callable[[str], None] | None = None,
-) -> list[tuple[Module, dict[str, torch.Tensor]]]:
-    """Normalize cached statistics, optimize one mapping, and return deployment."""
+) -> RTNQuantizationResult | SICQuantizationResult:
+    """Optimize one mapping without installing weights or smoothing."""
     layers = mapping.balance_layers
     weight_dtype = layers[0].weight.dtype
     device = layers[0].weight.device
@@ -86,7 +92,6 @@ def quantize_mapping(
             weight_dtype=weight_dtype,
             percdamp=dampening_frac,
         )
-        quantized_weight = result.quantized_weight
     else:
         sigma_x_squared = (
             cache.sigma_x_squared[mapping.mapping_name].to(weight.device) / sample_count
@@ -98,30 +103,36 @@ def quantize_mapping(
             alpha_dtype=alpha_dtype,
             sigma_x_squared=sigma_x_squared,
         )
-        quantized_weight = None
 
-    if _deployment_stage is not None:
-        _deployment_stage("smoothing")
-    scale = deploy_mapping_smooth_quant_scale(mapping, result.alpha_star)
+    return result
 
-    if not weight_only:
-        if _deployment_stage is not None:
-            _deployment_stage("input-scale replay")
-        # Replay reads pinned CPU buffers on the host; finish their D2H copies.
-        cache.wait(mapping.mapping_name, torch.device("cpu"))
-        replay_inputs = cache.inputs[mapping.mapping_name]
-        if mapping.mapping_name in cache.input_absmax:
-            # max(abs(s * x)) = max(abs(s) * max_tokens(abs(x))). Replay
-            # symmetric channel extrema using the original FP32 scale arithmetic.
-            maximum = cache.input_absmax[mapping.mapping_name].cpu()
-            replay_inputs = (torch.stack((-maximum, maximum)),)
-        _update_smoothed_input_global_scale(
-            layers,
-            replay_inputs,
-            scale,
-        )
-    if _deployment_stage is not None:
-        _deployment_stage("parameter preparation")
+
+def recalibrate_mapping_inputs(
+    mapping: OSFP4Mapping,
+    cache: OSFP4CalibrationCache,
+    scale: torch.Tensor,
+) -> None:
+    """Recalibrate W4A4 input parameters using full-data smoothing statistics."""
+    # Replay reads pinned CPU buffers on the host; finish their D2H copies.
+    cache.wait(mapping.mapping_name, torch.device("cpu"))
+    replay_inputs = cache.inputs[mapping.mapping_name]
+    if mapping.mapping_name in cache.input_absmax:
+        # max(abs(s * x)) = max(abs(s) * max_tokens(abs(x))). Replay
+        # symmetric channel extrema using the original FP32 scale arithmetic.
+        maximum = cache.input_absmax[mapping.mapping_name].cpu()
+        replay_inputs = (torch.stack((-maximum, maximum)),)
+    _update_smoothed_input_global_scale(mapping.balance_layers, replay_inputs, scale)
+
+
+def prepare_mapping_parameters(
+    mapping: OSFP4Mapping,
+    result: RTNQuantizationResult | SICQuantizationResult,
+) -> list[tuple[Module, dict[str, torch.Tensor]]]:
+    """Split optimized weight parameters into per-layer installation order."""
+    layers = mapping.balance_layers
+    quantized_weight = (
+        result.quantized_weight if isinstance(result, SICQuantizationResult) else None
+    )
     deployment: list[tuple[Module, dict[str, torch.Tensor]]] = []
     row_start = 0
     for layer in layers:
@@ -135,6 +146,7 @@ def quantize_mapping(
         qparams["weight_zero_point"] = result.weight_zero_point[row_start:row_end].to(
             layer.weight_zero_point
         )
+        # Selected block scales carry the scaling; the global multiplier is one.
         qparams["weight_global_scale"] = torch.ones_like(layer.weight_global_scale)
         deployment.append((layer, qparams))
         row_start = row_end
