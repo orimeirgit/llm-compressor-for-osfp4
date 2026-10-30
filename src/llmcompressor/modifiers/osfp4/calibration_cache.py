@@ -227,6 +227,8 @@ class OSFP4CalibrationCache:
                         cached_activation.copy_(source, non_blocking=True)
                     ready_event = torch.get_device_module(flat.device).Event()
                     ready_event.record(capture_stream)
+                # reshape may copy, so protect both the input and its flat view.
+                inputs.record_stream(capture_stream)
                 flat.record_stream(capture_stream)
                 # One ordered capture stream per device: its newest event covers
                 # all earlier captures for this mapping on that device.

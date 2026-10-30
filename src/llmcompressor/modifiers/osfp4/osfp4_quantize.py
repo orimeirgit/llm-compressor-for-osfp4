@@ -107,6 +107,8 @@ def quantize_mapping(
     if not weight_only:
         if _deployment_stage is not None:
             _deployment_stage("input-scale replay")
+        # Replay reads pinned CPU buffers on the host; finish their D2H copies.
+        cache.wait(mapping.mapping_name, torch.device("cpu"))
         replay_inputs = cache.inputs[mapping.mapping_name]
         if mapping.mapping_name in cache.input_absmax:
             # max(abs(s * x)) = max(abs(s) * max_tokens(abs(x))). Replay
