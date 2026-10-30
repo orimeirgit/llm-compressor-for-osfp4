@@ -97,15 +97,9 @@ def _search_e4m3_gamma_star(
     beta_max = torch.tensor(_BETA_MAX, device=W_target_blocks.device)
     fallback_used = torch.zeros((), device=W_target_blocks.device, dtype=torch.bool)
 
-    for row_start in range(
-        0,
-        total_rows,
-        rows_per_tile,
-    ):
-        row_end = min(
-            row_start + rows_per_tile,
-            total_rows,
-        )
+    for row_start in range(0, total_rows, rows_per_tile):
+        row_end = min(row_start + rows_per_tile, total_rows)
+
         # Collect candidate scales for these rows.
         tile_starts = candidate_starts[row_start:row_end]
         tile_ends = candidate_ends[row_start:row_end]
