@@ -818,3 +818,6 @@ env_log.json
 # uv artifacts
 uv.lock
 .venv/
+
+# OSFP4 RFC draft
+rfc-osfp4.md
