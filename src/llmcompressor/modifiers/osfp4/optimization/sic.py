@@ -32,7 +32,7 @@ def make_empty_hessian(
     module: Linear,
     device: torch.device | str | None = None,
 ) -> torch.Tensor:
-    """Allocate an FP32 raw input Gram matrix for an OSFP4 Linear module."""
+    """Allocate an FP32 Hessian matrix for an OSFP4 Linear module."""
     device = module.weight.device if device is None else device
     n = module.weight.shape[1]
     return torch.zeros(
