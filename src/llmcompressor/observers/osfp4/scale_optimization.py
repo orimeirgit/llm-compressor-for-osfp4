@@ -5,8 +5,7 @@ from collections.abc import Callable
 from typing import NamedTuple
 
 import torch
-
-from .fp4 import FP4_ABSMAX
+from compressed_tensors.quantization.quant_args import FP4_E2M1_DATA
 
 __all__ = [
     "QuantizationGroupScaleValues",
@@ -73,7 +72,7 @@ def initialize_scale_values_from_absmax(
             values.abs().amax(dim=reduction_dim, keepdim=True),
             min=eps,
         )
-        return maxima / FP4_ABSMAX
+        return maxima / FP4_E2M1_DATA.max
 
     L, _, block_width = W_blocks.shape
     alpha = torch.ones(
@@ -82,7 +81,7 @@ def initialize_scale_values_from_absmax(
         device=W_blocks.device,
         dtype=W_blocks.dtype,
     )
-    target_absmax = FP4_ABSMAX * _FP8_MAX / _FP8_SAFETY_FACTOR
+    target_absmax = FP4_E2M1_DATA.max * _FP8_MAX / _FP8_SAFETY_FACTOR
     W_blocks_normalized, weight_divisor = normalize(
         W_blocks,
         target_absmax,

@@ -8,7 +8,7 @@ import torch
 
 from llmcompressor.modifiers.osfp4 import optimization
 from llmcompressor.observers.osfp4 import scale_selection
-from llmcompressor.observers.osfp4.fp4 import (
+from tests.llmcompressor.observers.osfp4._naming_reference.fp4 import (
     quantize_e2m1,
 )
 
@@ -246,3 +246,26 @@ def test_beta_bounds_are_not_public_parameters():
             scale_selection._search_e4m3_gamma_star
         ).parameters
     )
+
+
+def test_scale_search_preserves_inputs_with_inplace_quantizer(monkeypatch):
+    problem = fp8_scale_search_problem()
+    before = tuple(value.clone() for value in problem)
+    expected = scale_selection._search_e4m3_gamma_star(*problem)
+    backend = scale_selection.FP4_E2M1_DATA.cast_to_fp4
+    calls = []
+
+    def inplace_quantizer(value):
+        calls.append(value.shape)
+        return value.copy_(backend(value))
+
+    monkeypatch.setattr(scale_selection.FP4_E2M1_DATA, "cast_to_fp4", inplace_quantizer)
+    actual = scale_selection._search_e4m3_gamma_star(*problem)
+    assert calls
+    for original, current in zip(before, problem):
+        assert torch.equal(original.view(torch.uint8), current.view(torch.uint8))
+    for old, new in zip(expected, actual):
+        if isinstance(old, torch.Tensor):
+            assert torch.equal(old.view(torch.uint8), new.view(torch.uint8))
+        else:
+            assert old == new

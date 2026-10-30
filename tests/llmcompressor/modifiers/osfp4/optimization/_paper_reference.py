@@ -19,7 +19,7 @@ from llmcompressor.observers.osfp4 import (
     OptimizedQuantizationGroupScales as CurrentOptimizedScales,
 )
 from llmcompressor.observers.osfp4 import OSFP4Observer
-from llmcompressor.observers.osfp4.fp4 import quantize_e2m1
+from tests.llmcompressor.observers.osfp4._naming_reference.fp4 import quantize_e2m1
 
 _QUANTIZATION_GROUP_SIZE = 16
 SIC_PRECISION = torch.float32

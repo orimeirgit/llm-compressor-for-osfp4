@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the OSFP4 and vLLM projects
 
 import torch
-
-from .fp4 import quantize_e2m1
+from compressed_tensors.quantization.quant_args import FP4_E2M1_DATA
 
 _QUANTIZATION_GROUP_SIZE = 16
 _BETA_MIN = 0.3
@@ -159,7 +158,7 @@ def _search_e4m3_gamma_star(
         tile_metric = weight_metric[block_indices]
         denominator = tile_alpha[:, None, :] * gamma_candidates[:, :, None]
         W_target_tile = W_target_flat[row_start:row_end, None, :]
-        quantized = quantize_e2m1(W_target_tile / denominator)
+        quantized = FP4_E2M1_DATA.cast_to_fp4(W_target_tile / denominator)
         reconstructed = denominator * quantized
         # Measure reconstruction error using the weight metric.
         candidate_errors = (

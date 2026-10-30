@@ -18,7 +18,7 @@ from llmcompressor.observers.osfp4 import (
     scale_selection,
 )
 from llmcompressor.observers.osfp4 import observer as osfp4_observer
-from llmcompressor.observers.osfp4.fp4 import quantize_e2m1
+from tests.llmcompressor.observers.osfp4._naming_reference.fp4 import quantize_e2m1
 
 
 def _make_observer(
@@ -591,13 +591,13 @@ def test_sic_runner_matches_block_selection_and_residual_reference(
 
     observer = RecordingObserver()
     quantize_inputs = []
-    original_quantize = quantize_e2m1
+    original_quantize = sic.FP4_E2M1_DATA.cast_to_fp4
 
     def record_quantize(values):
         quantize_inputs.append(values.clone())
         return original_quantize(values)
 
-    monkeypatch.setattr(sic, "quantize_e2m1", record_quantize)
+    monkeypatch.setattr(sic.FP4_E2M1_DATA, "cast_to_fp4", record_quantize)
     result = _optimize_sic(
         weight,
         [batch],

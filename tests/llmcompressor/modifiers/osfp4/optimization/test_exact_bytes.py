@@ -80,8 +80,9 @@ class ResidualTrace(TorchDispatchMode):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("groups", [1, 3])
+@pytest.mark.parametrize("inplace_backend", [False, True])
 def test_sic_quantizer_inputs_and_each_residual_update_match_bytes(
-    monkeypatch, dtype, groups
+    monkeypatch, dtype, groups, inplace_backend
 ):
     generator = torch.Generator().manual_seed(41)
     columns = groups * 16
@@ -124,13 +125,14 @@ def test_sic_quantizer_inputs_and_each_residual_update_match_bytes(
 
     ratios = []
     selection_targets = []
-    original_quantize = sic.quantize_e2m1
+    original_quantize = sic.FP4_E2M1_DATA.cast_to_fp4
 
     def quantize(value):
         ratios.append(value.clone())
-        return original_quantize(value)
+        result = original_quantize(value)
+        return value.copy_(result) if inplace_backend else result
 
-    monkeypatch.setattr(sic, "quantize_e2m1", quantize)
+    monkeypatch.setattr(sic.FP4_E2M1_DATA, "cast_to_fp4", quantize)
     with ResidualTrace() as trace:
         result = sic.optimize_sic(
             weight,

@@ -8,10 +8,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
+from compressed_tensors.quantization.quant_args import FP4_E2M1_DATA
 from torch.nn import Linear
 
 from llmcompressor.observers.osfp4 import OptimizedQuantizationGroupScales
-from llmcompressor.observers.osfp4.fp4 import quantize_e2m1
 
 from ._activation_groups import assemble_activation_quantization_groups
 
@@ -139,7 +139,9 @@ def optimize_sic(
 
         for t in range(block_end - 1, block_start - 1, -1):
             alpha_r = alpha_l[t - block_start]
-            W_SIC_t = quantize_e2m1((Y[t, :] / U[t, t]) / (alpha_r * gamma_w_final_l))
+            W_SIC_t = FP4_E2M1_DATA.cast_to_fp4(
+                (Y[t, :] / U[t, t]) / (alpha_r * gamma_w_final_l)
+            )
             W_hat[:, t] = (W_SIC_t * gamma_w_final_l).to(dtype=weight_dtype).float()
             Y[:t, :] -= U[:t, t].unsqueeze(1) * (alpha_r * W_hat[:, t]).unsqueeze(0)
 
