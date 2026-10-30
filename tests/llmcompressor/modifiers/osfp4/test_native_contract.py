@@ -6,7 +6,8 @@ import torch
 from compressed_tensors.transform import TransformConfig, TransformFactory
 
 from llmcompressor.core import Event, State, create_session
-from llmcompressor.modifiers import ModifierFactory, OSFP4Modifier
+from llmcompressor.modifiers import ModifierFactory
+from llmcompressor.modifiers.osfp4 import OSFP4Modifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.pipelines import CalibrationPipeline
 from llmcompressor.pipelines.independent.pipeline import IndependentPipeline

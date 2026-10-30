@@ -20,7 +20,7 @@ from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
 
 from llmcompressor.args import DatasetArguments
 from llmcompressor.core import create_session
-from llmcompressor.modifiers import OSFP4Modifier
+from llmcompressor.modifiers.osfp4 import OSFP4Modifier
 from llmcompressor.pipelines import CalibrationPipeline
 from llmcompressor.pipelines.sequential import pipeline as sequential
 from llmcompressor.transformers.compression.compressed_tensors_utils import (
