@@ -261,6 +261,14 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
                 if not smooth_layers:
                     continue
                 smooth_layer = smooth_layers[0]
+                if type(smooth_layer).__name__.startswith("Gemma"):
+                    # Gemma norms compute x * (1 + w), and Gemma2/3 route the MLP
+                    # through pre_feedforward_layernorm, so the shared SmoothQuant
+                    # mappings cannot be folded correctly.
+                    raise ValueError(
+                        "OSFP4 does not support Gemma smooth layers: "
+                        f"{module_names[smooth_layer]} ({type(smooth_layer).__name__})"
+                    )
                 balance_layers = tuple(tree_leaves(nested_balance_layers))
                 if not balance_layers:
                     logger.warning(

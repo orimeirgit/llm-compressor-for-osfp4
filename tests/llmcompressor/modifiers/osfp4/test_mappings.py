@@ -247,7 +247,6 @@ def test_real_representative_models_resolve_complete_coverage():
         (MistralForCausalLM, MistralConfig(**causal_kwargs)),
         (Qwen2ForCausalLM, Qwen2Config(**causal_kwargs)),
         (Qwen3ForCausalLM, Qwen3Config(**causal_kwargs, head_dim=8)),
-        (Gemma2ForCausalLM, Gemma2Config(**causal_kwargs, head_dim=8)),
         (Phi3ForCausalLM, Phi3Config(**causal_kwargs)),
         (
             BloomForCausalLM,
@@ -294,6 +293,23 @@ def test_real_representative_models_resolve_complete_coverage():
             if isinstance(module, torch.nn.Linear)
         }
         assert covered == expected, model_class.__name__
+
+
+def test_gemma_smooth_layers_are_rejected():
+    config = Gemma2Config(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+        vocab_size=32,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    with pytest.raises(ValueError, match="Gemma"):
+        _resolve_mappings(Gemma2ForCausalLM(config))
 
 
 def test_qwen3_decoder_layer_resolves_four_expected_mapping_groups():
