@@ -33,7 +33,7 @@ def _gather_rows(
     *,
     pin_memory: bool,
 ) -> torch.Tensor:
-    """Gather globally indexed rows from ordered activation batches."""
+    """Collect the selected activation rows from multiple batches into one tensor."""
     first = batches[0]
     sampled = torch.empty(
         (indices.numel(), first.shape[1]),
