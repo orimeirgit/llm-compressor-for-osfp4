@@ -135,6 +135,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
             )
         ):
             raise ValueError("OSFP4 initially supports dense models only")
+            
         self._resolved_mappings = self._resolve_mappings(state.model)
         self._reset_calibration_state()
         # State may contain a deep copy; count the loader the pipeline will consume.

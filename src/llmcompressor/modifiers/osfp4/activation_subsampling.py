@@ -65,23 +65,25 @@ def subsample_activations(
     """Select complete activation rows without changing global RNG state."""
     batches = cached_activation_batches
     dtype = batches[0].dtype
-    total = 0
+    total_tokens = 0
     all_pinned = True
+
     for batch in batches:
         if batch.dtype != dtype:
             raise ValueError("cached activation batches must share one dtype")
-        total += batch.shape[0]
+        total_tokens += batch.shape[0]
         all_pinned = all_pinned and batch.is_pinned()
-    size = min(total, requested_size)
 
-    if size == total:
-        indices = torch.arange(total, device="cpu", dtype=torch.int64)
-        selected = None
+    size = min(total_tokens, requested_size)
+
+    if size == total_tokens:
+        indices = torch.arange(total_tokens, device="cpu", dtype=torch.int64)
+        selected = None  # Reuse all original batches without copying.
     else:
         generator = torch.Generator(device="cpu")
         generator.manual_seed(_ACTIVATION_SUBSAMPLE_SEED)
         indices = torch.randperm(
-            total, generator=generator, device="cpu", dtype=torch.int64
+            total_tokens, generator=generator, device="cpu", dtype=torch.int64
         )[:size]
         indices = indices.sort().values
         selected = (_gather_rows(batches, indices, pin_memory=all_pinned),)
@@ -93,7 +95,7 @@ def subsample_activations(
             "seed": _ACTIVATION_SUBSAMPLE_SEED,
             "m": output_rows,
             "k": size,
-            "k1": total,
+            "k1": total_tokens,
             "index_sha256": hashlib.sha256(indices.numpy().tobytes()).hexdigest(),
         },
     )
