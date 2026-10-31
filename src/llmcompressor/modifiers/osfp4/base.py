@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the OSFP4 and vLLM projects
 
-import random
-from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
-import numpy as np
 import torch
 from compressed_tensors.offload.dist_utils import is_distributed
 from compressed_tensors.quantization import (
@@ -25,7 +22,6 @@ from loguru import logger
 from pydantic import Field, PrivateAttr, field_validator
 from torch.nn import Linear, Module
 from torch.utils._pytree import tree_leaves
-from torch.utils.data import IterableDataset
 from tqdm import tqdm
 
 from llmcompressor.core import Event, State, active_session
@@ -38,7 +34,7 @@ from llmcompressor.modifiers.transform.smoothquant.dynamic_mappings import (
 from llmcompressor.observers.min_max import StaticMinMaxObserver
 from llmcompressor.utils.pytorch.module import get_module_to_name_dict
 
-from .activation_subsampling import subsample_activations
+from .activation_subsampling import count_calibration_tokens, subsample_activations
 from .calibration_cache import OSFP4CalibrationCache
 from .optimization import RTNQuantizationResult, SICQuantizationResult
 from .osfp4_quantize import quantize_mapping
@@ -63,43 +59,56 @@ class OSFP4Mapping:
 
     @property
     def requires_runtime_smoothing(self) -> bool:
+        """Return whether the mapping needs an input transform because it has no smooth
+        layer.
+        """
         return self.smooth_layer is None
 
 
-def prepare_mapping_parameters(
-    mapping: OSFP4Mapping,
-    result: RTNQuantizationResult | SICQuantizationResult,
-) -> list[tuple[Module, dict[str, torch.Tensor]]]:
-    """Split optimized weight parameters into per-layer installation order."""
-    layers = mapping.balance_layers
-    quantized_weight = (
-        result.quantized_weight if isinstance(result, SICQuantizationResult) else None
-    )
-    deployment: list[tuple[Module, dict[str, torch.Tensor]]] = []
-    row_start = 0
-    for layer in layers:
-        row_end = row_start + layer.weight.shape[0]
-        qparams: dict[str, torch.Tensor] = {}
-        if quantized_weight is not None:
-            qparams["weight"] = quantized_weight[row_start:row_end].to(layer.weight)
-        qparams["weight_scale"] = result.gamma_w_final[row_start:row_end].to(
-            layer.weight_scale
-        )
-        qparams["weight_zero_point"] = result.weight_zero_point[row_start:row_end].to(
-            layer.weight_zero_point
-        )
-        # Selected block scales carry the scaling; the global multiplier is one.
-        qparams["weight_global_scale"] = torch.ones_like(layer.weight_global_scale)
-        deployment.append((layer, qparams))
-        row_start = row_end
-    return deployment
-
-
 class OSFP4Modifier(Modifier, QuantizationMixin):
-    """Optimize NVFP4 per mapping and deploy smooth-layer or runtime smoothing.
+    """Apply OSFP4 optimization to NVFP4 or NVFP4A16 quantization using RTN or SIC.
 
-    Permanent diagonal transforms preserve explicit smoothing during propagation,
-    evaluation, and serialization. Calibration hooks are temporary.
+    Each mapping is optimized jointly. It contains Linear layers sharing a
+    preceding smooth layer, or one Linear layer requiring a runtime input
+    transform.
+
+    Lifecycle:
+        1. on_initialize:
+           Validate the setup, resolve smooth-layer and runtime mappings,
+           attach permanent input transforms where needed, and initialize
+           quantization.
+
+        2. on_calibration_start:
+           Start observers, count tokens for activation subsampling when
+           possible, and register temporary hooks to capture batch activations.
+
+        3. on_sequential_epoch_end:
+           Validate sampling counts before optimizing any mapping. For each
+           observed mapping that has not been optimized, prepare optimization
+           inputs, run RTN or SIC, apply smoothing and quantization parameters,
+           and clear its cached data after successful deployment.
+
+        4. on_calibration_end:
+           Remove capture hooks, verify every mapping was optimized, update
+           optional KV-cache parameters, and freeze quantization.
+
+        5. on_finalize:
+           Verify completion and clear the remaining calibration cache and
+           mapping references. Keep deployed weights and input transforms.
+
+    Every calibration token contributes to the RTN or SIC statistics.
+    NVFP4 also caches activation values to evaluate reconstruction loss during
+    optimization. When subsampling is enabled, capture stores only the selected
+    token rows where possible. Otherwise, it stores all rows and selects the
+    subset before optimization. NVFP4A16 uses statistics without caching
+    activation values.
+
+    Smoothing multiplies each mapping's input channels by the deployed scale
+    and divides the corresponding weight columns in every balance layer by
+    the same scale. The input multiplication is implemented by updating the
+    preceding smooth layer's parameters or through a permanent runtime input
+    transform. The updated parameters and runtime transforms remain in the
+    model for inference and checkpoint export.
     """
 
     # Configuration
@@ -113,30 +122,110 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
     offload_hessians: bool = False
     activation_subsample_size: int | Literal["auto"] | None = "auto"
 
+    # Internal state
+
     _resolved_mappings: list[OSFP4Mapping] = PrivateAttr(default_factory=list)
     _calibration_dataloader: object = PrivateAttr(default=None)
-    _calibration: OSFP4CalibrationCache = PrivateAttr(
-        default_factory=OSFP4CalibrationCache
-    )
+    _calibration_cache: OSFP4CalibrationCache = PrivateAttr(default_factory=OSFP4CalibrationCache)
     _optimized_mapping_names: set[str] = PrivateAttr(default_factory=set)
     _finalization_complete: bool = PrivateAttr(default=False)
-    _deployment_failure: str | None = PrivateAttr(default=None)
+    _failed_deployment_mapping_name: str | None = PrivateAttr(default=None)
     _weight_only: bool = PrivateAttr(default=False)
-    _activation_subsampling_records: dict[str, dict[str, int | str]] = PrivateAttr(
-        default_factory=dict
-    )
+    _activation_subsampling_records: dict[str, dict[str, int | str]] = PrivateAttr(default_factory=dict)
 
     @field_validator("activation_subsample_size")
     @classmethod
-    def validate_subsample_size(cls, value):
+    def _validate_activation_subsample_size(cls, value):
+        """Reject nonpositive integer activation sample sizes."""
         if isinstance(value, int) and value <= 0:
             raise ValueError("activation_subsample_size must be positive")
         return value
 
-    # 1. Initialization: resolve mappings, reset state, and initialize quantization.
+    def resolve_quantization_config(self) -> QuantizationConfig:
+        """Validate NVFP4/NVFP4A16 groups, configure OSFP4 weight observers, and disable
+        activation subsampling for weight-only calibration.
+        """
+        config = QuantizationMixin.resolve_quantization_config(self)
+        observer_kwargs = {
+            "mode": self.optimization_mode,
+            "num_iters": self.steps,
+            "lr": self.lr,
+        }
+
+        def matches_quantization_args(actual, reference):
+            """Compare quantization arguments while ignoring observer names and options.
+            """
+            if actual is None or reference is None:
+                return actual is reference
+
+            excluded = {"observer", "observer_kwargs"}
+            return actual.model_dump(exclude=excluded) == reference.model_dump(
+                exclude=excluded
+            )
+
+        weight_only_groups = set()
+        for scheme in config.config_groups.values():
+            input_activations = scheme.input_activations
+            expected_scheme = preset_name_to_scheme(
+                "NVFP4A16" if input_activations is None else "NVFP4", []
+            )
+
+            if (
+                not matches_quantization_args(scheme.weights, expected_scheme.weights)
+                or not matches_quantization_args(
+                    input_activations, expected_scheme.input_activations
+                )
+                or scheme.output_activations is not None
+            ):
+                raise ValueError("OSFP4 supports only NVFP4 and NVFP4A16 schemes")
+            weight_only_groups.add(input_activations is None)
+            scheme.weights.observer = _OSFP4_OBSERVER
+            scheme.weights.observer_kwargs = observer_kwargs.copy()
+        if len(weight_only_groups) > 1:
+            raise ValueError("OSFP4 cannot mix NVFP4 and NVFP4A16 config groups")
+        self._weight_only = next(iter(weight_only_groups), False)
+        if self._weight_only:
+            self.activation_subsample_size = None
+        return config
+
+    @property
+    def resolved_weight_targets(self) -> set[str]:
+        """Return weight-target selectors from all resolved quantization groups."""
+        return {
+            target
+            for group in self.resolved_config.config_groups.values()
+            for target in group.targets
+        }
+
+    # Initialization
 
     def on_initialize(self, state: State, **kwargs) -> bool:
-        self._require_usable()
+        """Validate the setup, resolve mappings, reset capture state, attach runtime
+        transforms, and initialize quantization.
+        """
+        self._raise_if_deployment_failed()
+        self._validate_initialization(state, **kwargs)
+
+        self._resolved_mappings = self._resolve_mappings(state.model)
+        self._reset_calibration_state()
+        # State may contain a deep copy; count the loader the pipeline will consume.
+        self._calibration_dataloader = kwargs.get("calib_data", state.data.calib)
+        self._calibration_cache.offload_hessians = self.offload_hessians
+        initialize_diagonal_smoothing(
+            state.model,
+            [
+                mapping.mapping_name
+                for mapping in self._resolved_mappings
+                if mapping.requires_runtime_smoothing
+            ],
+        )
+        QuantizationMixin.initialize_quantization(self, state.model)
+        return True
+
+    def _validate_initialization(self, state: State, **kwargs) -> None:
+        """Reject unsupported execution, recipe, and model configurations before
+        modifying the model.
+        """
         if is_distributed():
             raise NotImplementedError("OSFP4 calibration is single-process")
         pipeline = kwargs.get("pipeline")
@@ -153,7 +242,9 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
                 "calibrate from an uncompressed model"
             )
         recipe = active_session().lifecycle.recipe
-        if recipe is not None and any(m is self for m in recipe.modifiers):
+        if recipe is not None and any(
+            modifier is self for modifier in recipe.modifiers
+        ):
             if len(recipe.modifiers) != 1:
                 raise ValueError("OSFP4 must be the only modifier in its recipe")
         config = getattr(state.model, "config", None)
@@ -170,24 +261,10 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         ):
             raise ValueError("OSFP4 initially supports dense models only")
 
-        self._resolved_mappings = self._resolve_mappings(state.model)
-        self._reset_calibration_state()
-        # State may contain a deep copy; count the loader the pipeline will consume.
-        self._calibration_dataloader = kwargs.get("calib_data", state.data.calib)
-        self._calibration.offload_hessians = self.offload_hessians
-        initialize_diagonal_smoothing(
-            state.model,
-            [
-                m.mapping_name
-                for m in self._resolved_mappings
-                if m.requires_runtime_smoothing
-            ],
-        )
-        QuantizationMixin.initialize_quantization(self, state.model)
-        return True
-
     def _resolve_mappings(self, model: Module) -> list[OSFP4Mapping]:
-        """Resolve smooth-layer mappings, then runtime mappings, in order."""
+        """Group selected Linear layers into smooth-layer mappings and create runtime
+        mappings for the remaining layers.
+        """
         selected = list(
             match_named_modules(model, self.resolved_weight_targets, self.ignore)
         )
@@ -224,64 +301,15 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         )
         return mappings
 
-    @property
-    def resolved_weight_targets(self) -> set[str]:
-        """Return all resolved weight targets across configuration groups."""
-        return {
-            target
-            for group in self.resolved_config.config_groups.values()
-            for target in group.targets
-        }
-
-    def resolve_quantization_config(self) -> QuantizationConfig:
-        config = QuantizationMixin.resolve_quantization_config(self)
-        observer_kwargs = {
-            "mode": self.optimization_mode,
-            "num_iters": self.steps,
-            "lr": self.lr,
-        }
-        weight_only_groups = set()
-        for scheme in config.config_groups.values():
-            inputs = scheme.input_activations
-            expected = preset_name_to_scheme(
-                "NVFP4A16" if inputs is None else "NVFP4", []
-            )
-
-            def matches(actual, reference):
-                return (
-                    actual is None
-                    and reference is None
-                    or (
-                        actual is not None
-                        and reference is not None
-                        and actual.model_dump(exclude={"observer", "observer_kwargs"})
-                        == reference.model_dump(exclude={"observer", "observer_kwargs"})
-                    )
-                )
-
-            if (
-                not matches(scheme.weights, expected.weights)
-                or not matches(inputs, expected.input_activations)
-                or scheme.output_activations is not None
-            ):
-                raise ValueError("OSFP4 supports only NVFP4 and NVFP4A16 schemes")
-            weight_only_groups.add(inputs is None)
-            scheme.weights.observer = _OSFP4_OBSERVER
-            scheme.weights.observer_kwargs = observer_kwargs.copy()
-        if len(weight_only_groups) > 1:
-            raise ValueError("OSFP4 cannot mix NVFP4 and NVFP4A16 config groups")
-        self._weight_only = next(iter(weight_only_groups), False)
-        self.weight_observer = _OSFP4_OBSERVER
-        if self._weight_only:
-            self.activation_subsample_size = None
-        return config
-
     def _resolve_smooth_layer_mappings(
         self,
         model: Module,
         selected_balance_layers: set[Module],
         module_names: dict[Module, str],
     ) -> list[OSFP4Mapping]:
+        """Build mappings from SmoothQuant specifications whose balance layers are all
+        selected for quantization.
+        """
         mappings = []
         for spec in get_layer_mappings_from_model(model):
             for *nested_balance_layers, smooth_layers in match_modules_set(
@@ -314,68 +342,26 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         return mappings
 
     def _reset_calibration_state(self) -> None:
-        """Clear temporary calibration state before initialization."""
-        self._calibration.clear_all()
+        """Clear captured data, optimization progress, and sampling records, and reset
+        finalization state.
+        """
+        self._calibration_cache.clear_all()
         self._optimized_mapping_names.clear()
         self._activation_subsampling_records.clear()
         self._finalization_complete = False
 
-    # 2. Calibration setup: register capture hooks for sequential forward passes.
-
-    @staticmethod
-    def _calibration_token_count(dataloader) -> int | None:
-        """Count collated token rows without model forwards or advancing RNGs."""
-        if (
-            dataloader is None
-            or isinstance(dataloader, Iterator)
-            or isinstance(getattr(dataloader, "dataset", None), IterableDataset)
-        ):
-            return None
-        # Persistent worker RNGs cannot be restored from the main process.
-        if getattr(dataloader, "persistent_workers", False):
-            return None
-        generators = {
-            generator
-            for owner in (dataloader, getattr(dataloader, "sampler", None))
-            if isinstance(
-                generator := getattr(owner, "generator", None), torch.Generator
-            )
-        }
-        generator_states = {g: g.get_state() for g in generators}
-        python_rng, numpy_rng = random.getstate(), np.random.get_state()
-        devices = (
-            list(range(torch.get_device_module("cuda").device_count()))
-            if torch.get_device_module("cuda").is_initialized()
-            else []
-        )
-        try:
-            with torch.random.fork_rng(devices=devices):
-                total_num_tokens = 0
-                for batch in dataloader:
-                    if not isinstance(batch, Mapping):
-                        return None
-                    inputs = batch.get("input_ids")
-                    if isinstance(inputs, torch.Tensor):
-                        total_num_tokens += inputs.numel()
-                    else:
-                        inputs = batch.get("inputs_embeds")
-                        if not isinstance(inputs, torch.Tensor):
-                            return None
-                        total_num_tokens += inputs.numel() // inputs.shape[-1]
-                return total_num_tokens or None
-        finally:
-            random.setstate(python_rng)
-            np.random.set_state(numpy_rng)
-            for generator, rng in generator_states.items():
-                generator.set_state(rng)
+    # Calibration capture
 
     def on_calibration_start(self, state: State, event: Event, **kwargs):
-        self._require_usable()
+        """Start observers, count tokens when subsampling is requested, and register
+        calibration capture hooks.
+        """
+        self._raise_if_deployment_failed()
         if is_distributed():
             raise NotImplementedError("OSFP4 calibration is single-process")
         QuantizationMixin.start_calibration(self, state.model)
         total_num_tokens = (
-            self._calibration_token_count(self._calibration_dataloader)
+            count_calibration_tokens(self._calibration_dataloader)
             if self.activation_subsample_size is not None and not self._weight_only
             else None
         )
@@ -390,8 +376,14 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
                 "OSFP4 cannot count calibration token rows; "
                 "using full activation caching"
             )
+        self._setup_capture_hooks(total_num_tokens)
+
+    def _setup_capture_hooks(self, total_num_tokens: int | None) -> None:
+        """Validate all sampling caps, then register an input capture hook on each
+        mapping's first balance layer.
+        """
         activation_subsample_sizes = [
-            self._resolve_activation_subsample_size(mapping)[0]
+            self._resolve_activation_subsample_size(mapping)
             for mapping in self._resolved_mappings
         ]
         for mapping, activation_subsample_size in zip(
@@ -411,7 +403,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
             )
             self.register_hook(
                 mapping.balance_layers[0],
-                self._calibration.make_capture_hook(
+                self._calibration_cache.make_capture_hook(
                     mapping.mapping_name,
                     optimization_mode=self.optimization_mode,
                     cache_activations=not self._weight_only,
@@ -423,83 +415,14 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
                 "forward_pre",
             )
 
-    # 3. Optimization after each subgraph: sample, optimize, deploy, and clear caches.
-
-    def on_sequential_epoch_end(
-        self,
-        state: State,
-        event: Event,
-        modules: list[Module],
-        **kwargs,
-    ):
-        self._optimize_available_mappings()
-
-    def _optimize_available_mappings(self) -> None:
-        """Optimize each observed mapping that has not yet been processed."""
-        self._require_usable()
-        available = [
-            mapping
-            for mapping in self._resolved_mappings
-            if self._calibration.has_calibration_data(mapping.mapping_name)
-            and mapping.mapping_name not in self._optimized_mapping_names
-        ]
-        for mapping in available:
-            self._calibration.validate_sampling(mapping.mapping_name)
-        for mapping in tqdm(available, desc="OSFP4 layer optimization"):
-            self._optimize_mapping(mapping)
-
-    def _optimize_mapping(self, mapping: OSFP4Mapping) -> None:
-        self._require_usable()
-        if mapping.mapping_name in self._optimized_mapping_names:
-            return
-        sampled_activations = self._sample_optimization_activations(mapping)
-        result = quantize_mapping(
-            mapping,
-            self._calibration,
-            optimization_mode=self.optimization_mode,
-            dampening_frac=self.dampening_frac,
-            weight_only=self._weight_only,
-            sampled_activations=sampled_activations,
-        )
-        self._deploy_mapping(mapping, result)
-        self._optimized_mapping_names.add(mapping.mapping_name)
-        self._calibration.clear_mapping(mapping.mapping_name)
-
-    def _sample_optimization_activations(
-        self, mapping: OSFP4Mapping
-    ) -> tuple[torch.Tensor, ...] | None:
-        activation_subsample_size, input_width = (
-            self._resolve_activation_subsample_size(mapping)
-        )
-        if activation_subsample_size is None:
-            return None
-
-        output_rows = sum(layer.weight.shape[0] for layer in mapping.balance_layers)
-        if mapping.mapping_name in self._calibration.sampled_indices:
-            selection = self._calibration.prepare_sampled_activations(
-                mapping.mapping_name, output_rows
-            )
-        else:
-            # Finish D2H capture before sampling the cached CPU rows.
-            self._calibration.wait_for_capture(mapping.mapping_name, torch.device("cpu"))
-            selection = subsample_activations(
-                self._calibration.cached_activations[mapping.mapping_name],
-                activation_subsample_size,
-                output_rows=output_rows,
-            )
-        provenance = selection.provenance.copy()
-        if input_width is not None:
-            provenance["policy"] = "auto"
-            provenance["n"] = input_width
-        self._activation_subsampling_records[mapping.mapping_name] = provenance
-        return selection.batches
-
     def _resolve_activation_subsample_size(
         self, mapping: OSFP4Mapping
-    ) -> tuple[int | None, int | None]:
-        """Resolve the row cap and the input width recorded for auto sampling."""
+    ) -> int | None:
+        """Return the configured token cap, twice the shared input width for auto
+        sampling, or None to disable subsampling.
+        """
         if self.activation_subsample_size != "auto":
-            return self.activation_subsample_size, None
+            return self.activation_subsample_size
         input_widths = {layer.weight.shape[1] for layer in mapping.balance_layers}
         if len(input_widths) != 1:
             raise ValueError(
@@ -508,29 +431,154 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
                 f"{sorted(input_widths)}"
             )
         input_width = input_widths.pop()
-        return 2 * input_width, input_width
+        return 2 * input_width
+
+    # Mapping optimization and deployment
+
+    def on_sequential_epoch_end(
+        self,
+        state: State,
+        event: Event,
+        modules: list[Module],
+        **kwargs,
+    ):
+        """Validate sampling counts for all observed, unoptimized mappings before
+        optimizing any of them.
+        """
+        # Optimize available mappings.
+        self._raise_if_deployment_failed()
+        available_mappings = [
+            mapping
+            for mapping in self._resolved_mappings
+            if self._calibration_cache.has_calibration_data(mapping.mapping_name)
+            and mapping.mapping_name not in self._optimized_mapping_names
+        ]
+        for mapping in available_mappings:
+            self._calibration_cache.validate_sampling(mapping.mapping_name)
+        for mapping in tqdm(available_mappings, desc="OSFP4 layer optimization"):
+            self._optimize_mapping(mapping)
+
+    def _optimize_mapping(self, mapping: OSFP4Mapping) -> None:
+        """Optimize and deploy one mapping, then mark it complete and clear its cache.
+
+        The caller must select a mapping that has not already been optimized.
+        """
+        self._raise_if_deployment_failed()
+        sampled_activations = self._prepare_optimization_activations(mapping)
+        result = quantize_mapping(
+            mapping,
+            self._calibration_cache,
+            optimization_mode=self.optimization_mode,
+            dampening_frac=self.dampening_frac,
+            weight_only=self._weight_only,
+            sampled_activations=sampled_activations,
+        )
+        self._deploy_mapping(mapping, result)
+        self._optimized_mapping_names.add(mapping.mapping_name)
+        self._calibration_cache.clear_mapping(mapping.mapping_name)
+
+    def _prepare_optimization_activations(
+        self, mapping: OSFP4Mapping
+    ) -> tuple[torch.Tensor, ...] | None:
+        """Prepare activation rows for reconstruction loss and record sampling metadata.
+
+        Reuse rows sampled during capture, or sample the full activation cache. Return
+        None when no separate activation subset is needed.
+        """
+        activation_subsample_size = self._resolve_activation_subsample_size(mapping)
+        if activation_subsample_size is None:
+            return None
+
+        output_rows = sum(layer.weight.shape[0] for layer in mapping.balance_layers)
+        if mapping.mapping_name in self._calibration_cache.sampled_indices:
+            selection = self._calibration_cache.prepare_sampled_activations(
+                mapping.mapping_name, output_rows
+            )
+        else:
+            # Finish D2H capture before sampling the cached CPU rows.
+            self._calibration_cache.wait_for_capture(
+                mapping.mapping_name, torch.device("cpu")
+            )
+            selection = subsample_activations(
+                self._calibration_cache.cached_activations[mapping.mapping_name],
+                activation_subsample_size,
+                output_rows=output_rows,
+            )
+        provenance = selection.provenance.copy()
+        provenance["activation_subsample_size"] = activation_subsample_size
+        if self.activation_subsample_size == "auto":
+            provenance["policy"] = "auto"
+        self._activation_subsampling_records[mapping.mapping_name] = provenance
+        return selection.batches
 
     def _deploy_mapping(
         self,
         mapping: OSFP4Mapping,
         result: RTNQuantizationResult | SICQuantizationResult,
     ) -> None:
+        """Apply smoothing, update input scales, and install optimized weight
+        parameters.
+
+        Prepare parameters for every balance layer before installing them. If deployment
+        fails, mark the modifier unusable because the model may already be partially
+        modified.
+        """
+        def prepare_mapping_parameters() -> (
+            list[tuple[Module, dict[str, torch.Tensor]]]
+        ):
+            """Split optimized weight parameters into per-layer tensors matching the
+            destination dtypes and devices.
+            """
+            balance_layers = mapping.balance_layers
+            quantized_weight = (
+                result.quantized_weight
+                if isinstance(result, SICQuantizationResult)
+                else None
+            )
+            deployment: list[tuple[Module, dict[str, torch.Tensor]]] = []
+            row_start = 0
+            for layer in balance_layers:
+                row_end = row_start + layer.weight.shape[0]
+                qparams: dict[str, torch.Tensor] = {}
+                if quantized_weight is not None:
+                    qparams["weight"] = quantized_weight[row_start:row_end].to(
+                        layer.weight
+                    )
+                qparams["weight_scale"] = result.gamma_w_final[row_start:row_end].to(
+                    layer.weight_scale
+                )
+                qparams["weight_zero_point"] = result.weight_zero_point[
+                    row_start:row_end
+                ].to(layer.weight_zero_point)
+                # Selected block scales carry the scaling; the global multiplier is one.
+                qparams["weight_global_scale"] = torch.ones_like(
+                    layer.weight_global_scale
+                )
+                deployment.append((layer, qparams))
+                row_start = row_end
+            return deployment
+
         try:
-            scale = deploy_mapping_smooth_quant_scale(mapping, result.alpha)
+            deployed_scale = deploy_mapping_smooth_quant_scale(mapping, result.alpha)
             if not self._weight_only:
-                update_smoothed_input_global_scale(mapping, self._calibration, scale)
-            deployment = prepare_mapping_parameters(mapping, result)
+                update_smoothed_input_global_scale(
+                    mapping, self._calibration_cache, deployed_scale
+                )
+            deployment = prepare_mapping_parameters()
             for layer, qparams in deployment:
                 for name, value in qparams.items():
                     update_offload_parameter(layer, name, value)
         except BaseException as error:
             # No rollback: even a failed first write may have changed offload state.
-            self._deployment_failure = mapping.mapping_name
+            self._failed_deployment_mapping_name = mapping.mapping_name
             raise RuntimeError(self._deployment_failure_message()) from error
 
-    # 4. Calibration completion: remove hooks, verify coverage, and freeze quantization.
+    # Calibration completion
 
     def on_calibration_end(self, state: State, event: Event, **kwargs):
+        """Remove capture hooks, verify every mapping was optimized, update optional
+        KV-cache parameters, and freeze quantization.
+        """
         self.remove_hooks()
         self._require_complete_calibration()
         if self.kv_cache_scheme is not None:
@@ -545,47 +593,59 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
             update_qparams(kv_modules, ("q", "k", "v"))
         QuantizationMixin.end_calibration(self, state.model)
 
-    # 5. Finalization: preserve transforms and clear calibration state.
-
     def on_finalize(self, state: State, **kwargs) -> bool:
+        """Verify calibration completed, clear captured data and mapping references, and
+        mark finalization complete.
+        """
         if self._finalization_complete:
             return True
         self._require_complete_calibration()
-        self._calibration.clear_all()
+        self._calibration_cache.clear_all()
         self._resolved_mappings.clear()
         self._finalization_complete = True
         return True
 
-    # 6. Verify coverage and reject reuse after failed deployment.
-
     def _require_complete_calibration(self) -> None:
-        """Reject calibration that did not optimize every resolved mapping."""
-        self._require_usable()
-        expected = {mapping.mapping_name for mapping in self._resolved_mappings}
-        missing = sorted(expected - self._optimized_mapping_names)
-        if missing:
+        """Reject failed deployment or mappings that have not been optimized."""
+        self._raise_if_deployment_failed()
+        expected_mapping_names = {
+            mapping.mapping_name for mapping in self._resolved_mappings
+        }
+        missing_mapping_names = sorted(
+            expected_mapping_names - self._optimized_mapping_names
+        )
+        if missing_mapping_names:
             raise RuntimeError(
                 "OSFP4 calibration did not observe every required registry mapping; "
-                f"missing {missing}. Use oneshot(..., pipeline='sequential')."
+                f"missing {missing_mapping_names}. Use oneshot(..., pipeline='sequential')."
             )
 
-    def _require_usable(self) -> None:
-        if self._deployment_failure is not None:
+    # Deployment failure handling
+
+    def _raise_if_deployment_failed(self) -> None:
+        """Prevent further use of a modifier whose deployment may have partially changed
+        the model.
+        """
+        if self._failed_deployment_mapping_name is not None:
             raise RuntimeError(self._deployment_failure_message())
 
     def _deployment_failure_message(self) -> str:
-        assert self._deployment_failure is not None
+        """Describe the failed mapping and the requirement to reload a fresh model."""
         return (
-            f"OSFP4 deployment failed for mapping {self._deployment_failure!r}; "
+            f"OSFP4 deployment failed for mapping {self._failed_deployment_mapping_name!r}; "
             "the model may be partially modified. Reload a fresh model and create "
             "a fresh OSFP4Modifier; this modifier cannot be retried."
         )
 
-    # 7. Reporting: expose sampling provenance for callers.
+    # Sampling records
 
     @property
     def activation_subsampling_records(self) -> dict[str, dict[str, int | str]]:
-        """Return JSON-serializable sampling provenance for optimized mappings."""
+        """Return sampling metadata copies for tests and calibration-run comparisons.
+
+        Tests use these records to verify sampling policies, token counts, and
+        selected-index hashes remain unchanged across refactors.
+        """
         return {
             mapping_name: record.copy()
             for mapping_name, record in self._activation_subsampling_records.items()

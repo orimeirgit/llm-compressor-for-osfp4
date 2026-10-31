@@ -15,8 +15,12 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 from llmcompressor.args import DatasetArguments
 from llmcompressor.core import Event, State, create_session
-from llmcompressor.modifiers.osfp4 import OSFP4Modifier
-from llmcompressor.modifiers.osfp4.activation_subsampling import subsample_activations
+from llmcompressor.modifiers.osfp4 import OSFP4Modifier, base
+from llmcompressor.modifiers.osfp4.activation_subsampling import (
+    count_calibration_tokens,
+    subsample_activations,
+)
+from llmcompressor.modifiers.osfp4.base import OSFP4Mapping
 from llmcompressor.modifiers.osfp4.calibration_cache import OSFP4CalibrationCache
 from llmcompressor.pipelines import CalibrationPipeline
 from llmcompressor.pipelines.sequential import pipeline as sequential
@@ -70,7 +74,7 @@ def test_automatic_count_uses_collated_rows_and_preserves_rng(embeddings):
     )
     python_rng, numpy_rng = random.getstate(), np.random.get_state()
     torch_rng, loader_rng = torch.get_rng_state(), generator.get_state()
-    count = OSFP4Modifier._calibration_token_count(loader)
+    count = count_calibration_tokens(loader)
     assert random.getstate() == python_rng
     assert np.random.get_state()[0] == numpy_rng[0]
     np.testing.assert_array_equal(np.random.get_state()[1], numpy_rng[1])
@@ -137,7 +141,7 @@ def test_capture_matches_legacy_bytes_and_statistics(
 
 def test_count_does_not_consume_one_shot_data():
     batches = iter([{"input_ids": torch.arange(5)}])
-    assert OSFP4Modifier._calibration_token_count(batches) is None
+    assert count_calibration_tokens(batches) is None
     assert_bytes(next(batches)["input_ids"], torch.arange(5))
 
     class OneShotDataset(torch.utils.data.IterableDataset):
@@ -145,7 +149,7 @@ def test_count_does_not_consume_one_shot_data():
             raise AssertionError("must not consume iterable data to count it")
 
     loader = torch.utils.data.DataLoader(OneShotDataset())
-    assert OSFP4Modifier._calibration_token_count(loader) is None
+    assert count_calibration_tokens(loader) is None
 
 
 @pytest.mark.parametrize("expected", [10, 12])
@@ -173,6 +177,103 @@ def test_incorrect_count_fails_before_optimization(expected):
         modifier.remove_hooks()
 
 
+def test_all_subsample_sizes_are_validated_before_capture_hooks():
+    model = TinyModel()
+    modifier = OSFP4Modifier(scheme="NVFP4", ignore=["lm_head"])
+    state = State(model=model)
+    modifier.on_initialize(state)
+    modifier._resolved_mappings.append(
+        OSFP4Mapping(
+            "incompatible_widths",
+            None,
+            (model.model.layers[0].mlp.up_proj, model.model.layers[0].mlp.down_proj),
+        )
+    )
+    before = {name: value.clone() for name, value in model.state_dict().items()}
+    try:
+        with patch.object(
+            modifier._calibration_cache,
+            "make_capture_hook",
+            wraps=modifier._calibration_cache.make_capture_hook,
+        ) as capture:
+            with pytest.raises(ValueError, match="different input widths"):
+                modifier.on_calibration_start(state, Event())
+        capture.assert_not_called()
+        for name, value in model.state_dict().items():
+            assert_bytes(value, before[name], name)
+    finally:
+        modifier.remove_hooks()
+
+
+def test_later_mapping_count_error_prevents_all_optimization():
+    model = TinyModel()
+    modifier = OSFP4Modifier(scheme="NVFP4", ignore=["lm_head"], steps=1)
+    state = State(model=model)
+    state.data.calib = [{"input_ids": torch.zeros(1, 5, dtype=torch.long)}]
+    modifier.on_initialize(state)
+    modifier.on_calibration_start(state, Event())
+    try:
+        model(torch.randn(1, 5, 16))
+        first, second = modifier._resolved_mappings[:2]
+        modifier._calibration_cache.validate_sampling(first.mapping_name)
+        modifier._calibration_cache.token_count[second.mapping_name] -= 1
+        before = {name: value.clone() for name, value in model.state_dict().items()}
+        with patch.object(
+            OSFP4Modifier,
+            "_optimize_mapping",
+            side_effect=AssertionError("must validate every mapping first"),
+        ) as optimize:
+            with pytest.raises(ValueError, match="calibration tokens"):
+                modifier.on_sequential_epoch_end(state, Event(), list(model.modules()))
+        optimize.assert_not_called()
+        assert not modifier._optimized_mapping_names
+        assert modifier._calibration_cache.has_calibration_data(first.mapping_name)
+        for name, value in model.state_dict().items():
+            assert_bytes(value, before[name], name)
+    finally:
+        modifier.remove_hooks()
+
+
+@pytest.mark.parametrize("scheme", ["NVFP4", "NVFP4A16"])
+@pytest.mark.parametrize("mode", ["rtn", "sic"])
+def test_sequential_stage_skips_optimized_mappings_with_new_capture(scheme, mode):
+    torch.manual_seed(7)
+    model = TinyModel()
+    modifier = OSFP4Modifier(
+        scheme=scheme, optimization_mode=mode, ignore=["lm_head"], steps=1
+    )
+    state = State(model=model)
+    modifier.on_initialize(state)
+    modifier.on_calibration_start(state, Event())
+    try:
+        inputs = torch.randn(1, 11, 16)
+        model(inputs)
+        modifier.on_sequential_epoch_end(state, Event(), list(model.modules()))
+        assert modifier._optimized_mapping_names == {
+            mapping.mapping_name for mapping in modifier._resolved_mappings
+        }
+
+        model(inputs)
+        assert all(
+            modifier._calibration_cache.has_calibration_data(mapping.mapping_name)
+            for mapping in modifier._resolved_mappings
+        )
+        before = {name: value.clone() for name, value in model.state_dict().items()}
+        with patch.object(
+            modifier,
+            "_optimize_mapping",
+            side_effect=AssertionError("must not optimize a mapping twice"),
+        ) as optimize:
+            modifier.on_sequential_epoch_end(state, Event(), list(model.modules()))
+        optimize.assert_not_called()
+        for name, value in model.state_dict().items():
+            assert_bytes(value, before[name], name)
+        modifier.on_calibration_end(state, Event())
+        modifier.on_finalize(state)
+    finally:
+        modifier.remove_hooks()
+
+
 @pytest.mark.parametrize("fallback", ["unknown", "uncapped", "custom", "weight_only"])
 def test_existing_capture_fallback(fallback):
     model = TinyModel()
@@ -194,10 +295,10 @@ def test_existing_capture_fallback(fallback):
     modifier.on_calibration_start(state, Event())
     try:
         model(torch.randn(1, 11, 16))
-        assert not modifier._calibration.sampled_indices
-        for batches in modifier._calibration.cached_activations.values():
+        assert not modifier._calibration_cache.sampled_indices
+        for batches in modifier._calibration_cache.cached_activations.values():
             assert sum(batch.shape[0] for batch in batches) == 11
-        assert bool(modifier._calibration.cached_activations) == (
+        assert bool(modifier._calibration_cache.cached_activations) == (
             fallback != "weight_only"
         )
     finally:
@@ -251,14 +352,14 @@ def test_pipeline_and_saved_checkpoint_byte_parity(tmp_path, device, dtype, mode
             if not streaming:
                 stack.enter_context(
                     patch.object(
-                        OSFP4Modifier, "_calibration_token_count", return_value=None
+                        base, "count_calibration_tokens", return_value=None
                     )
                 )
             capture = stack.enter_context(
                 patch.object(
-                    modifier._calibration,
+                    modifier._calibration_cache,
                     "make_capture_hook",
-                    wraps=modifier._calibration.make_capture_hook,
+                    wraps=modifier._calibration_cache.make_capture_hook,
                 )
             )
             stack.enter_context(
@@ -282,6 +383,13 @@ def test_pipeline_and_saved_checkpoint_byte_parity(tmp_path, device, dtype, mode
             session.finalize()
         assert capture.call_args_list
         total = next(iter(modifier.activation_subsampling_records.values()))["k1"]
+        if cap != "auto":
+            assert all(
+                record["activation_subsample_size"] == cap
+                and record["k"] == min(total, cap)
+                and "n" not in record
+                for record in modifier.activation_subsampling_records.values()
+            )
         assert all(
             call.kwargs["total_num_tokens"] == (total if streaming else None)
             for call in capture.call_args_list
@@ -333,7 +441,9 @@ def test_auto_matches_fixed_twice_input_width_for_streaming_and_fallback(rows, w
                 if not streaming:
                     stack.enter_context(
                         patch.object(
-                            OSFP4Modifier, "_calibration_token_count", return_value=None
+                            base,
+                            "count_calibration_tokens",
+                            return_value=None,
                         )
                     )
                 modifier.on_calibration_start(state, Event())
@@ -342,10 +452,10 @@ def test_auto_matches_fixed_twice_input_width_for_streaming_and_fallback(rows, w
                     selected = {}
                     for mapping in modifier._resolved_mappings:
                         n = mapping.balance_layers[0].weight.shape[1]
-                        batches = modifier._sample_optimization_activations(mapping)
+                        batches = modifier._prepare_optimization_activations(mapping)
                         selected[mapping.mapping_name] = torch.cat(
                             batches
-                            or modifier._calibration.cached_activations[
+                            or modifier._calibration_cache.cached_activations[
                                 mapping.mapping_name
                             ]
                         )
@@ -353,8 +463,11 @@ def test_auto_matches_fixed_twice_input_width_for_streaming_and_fallback(rows, w
                             mapping.mapping_name
                         ]
                         assert record["k"] == min(rows, 2 * n)
-                        if cap == "auto":
-                            assert record["policy"] == "auto" and record["n"] == n
+                        assert record["activation_subsample_size"] == 2 * n
+                        assert record["policy"] == (
+                            "auto" if cap == "auto" else "fixed"
+                        )
+                        assert "n" not in record
                     records = modifier.activation_subsampling_records
                     snapshots.append((streaming, cap, selected, records))
                 finally:
@@ -368,6 +481,5 @@ def test_auto_matches_fixed_twice_input_width_for_streaming_and_fallback(rows, w
         for mapping_name, tensor in auto[2].items():
             assert_bytes(tensor, fixed[2][mapping_name], mapping_name)
             record = dict(auto[3][mapping_name])
-            del record["n"]
             record["policy"] = "fixed"
             assert record == fixed[3][mapping_name]

@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+from compressed_tensors.quantization import preset_name_to_scheme
 from compressed_tensors.transform import TransformConfig, TransformFactory
 
 from llmcompressor.core import Event, State, create_session
@@ -12,6 +13,7 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.pipelines import CalibrationPipeline
 from llmcompressor.pipelines.independent.pipeline import IndependentPipeline
 from llmcompressor.pipelines.sequential import SequentialPipeline
+from llmcompressor.recipe import Recipe
 
 from ._testing import LlamaForCausalLM, make_osfp4_modifier, run_modifier
 
@@ -28,7 +30,7 @@ def test_finalize_preserves_smoothing_and_clears_capture_state(mode, scheme):
     modifier.on_finalize(State(model=model))
     torch.testing.assert_close(model(x), expected, rtol=0, atol=0)
     assert list(layer._forward_pre_hooks) == before_hooks
-    assert not modifier._calibration.cached_activations
+    assert not modifier._calibration_cache.cached_activations
     assert not modifier._resolved_mappings
     assert isinstance(model.transform_config, TransformConfig)
 
@@ -107,6 +109,56 @@ def test_invalid_options_rejected(kwargs):
 def test_other_schemes_rejected(scheme):
     with pytest.raises(ValueError, match="only NVFP4"):
         _ = OSFP4Modifier(scheme=scheme).resolved_config
+
+
+@pytest.mark.parametrize("scheme", ["NVFP4", "NVFP4A16"])
+@pytest.mark.parametrize("optimization_mode", ["rtn", "sic"])
+@pytest.mark.parametrize("configuration", ["preset", "config_groups"])
+@pytest.mark.parametrize(
+    "observer_options",
+    [
+        {},
+        {"observer": {"weights": "minmax"}},
+        {"observer": {"input": "static_minmax"}},
+        {"weight_observer": "minmax"},
+    ],
+    ids=["default", "weight_dict", "input_dict", "weight_argument"],
+)
+def test_observer_configuration_survives_recipe_reload_and_repeated_resolution(
+    scheme, optimization_mode, configuration, observer_options
+):
+    configuration_options = (
+        {"scheme": scheme}
+        if configuration == "preset"
+        else {"config_groups": {"group_0": preset_name_to_scheme(scheme, ["Linear"])}}
+    )
+    modifier = OSFP4Modifier(
+        **configuration_options,
+        **observer_options,
+        optimization_mode=optimization_mode,
+        steps=3,
+        lr=0.03,
+    )
+    expected = modifier.resolved_config.model_dump(mode="json")
+
+    # Resolving the config must not create conflicting recipe observer options.
+    serialized_recipe = Recipe.from_modifiers(modifier).yaml()
+    restored = Recipe.create_instance(serialized_recipe).modifiers[0]
+    assert restored.resolved_config.model_dump(mode="json") == expected
+
+    for candidate in (modifier, restored):
+        assert (
+            candidate.resolve_quantization_config().model_dump(mode="json") == expected
+        )
+        assert candidate.weight_observer == observer_options.get("weight_observer")
+        assert candidate.observer == observer_options.get("observer")
+        for group in candidate.resolved_config.config_groups.values():
+            assert group.weights.observer == "osfp4"
+            assert group.weights.observer_kwargs == {
+                "mode": optimization_mode,
+                "num_iters": 3,
+                "lr": 0.03,
+            }
 
 
 def test_dense_only_and_distributed_guards(monkeypatch):

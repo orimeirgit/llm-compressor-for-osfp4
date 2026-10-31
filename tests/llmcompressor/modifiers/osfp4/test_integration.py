@@ -237,7 +237,7 @@ def test_global_scales_use_exact_post_alpha_calibration_absmax():
         model(batch)
     cached = {
         mapping_name: [value.clone() for value in values]
-        for mapping_name, values in modifier._calibration.cached_activations.items()
+        for mapping_name, values in modifier._calibration_cache.cached_activations.items()
     }
     modifier.on_sequential_epoch_end(state, event, list(model.modules()))
     modifier.on_calibration_end(state, event)

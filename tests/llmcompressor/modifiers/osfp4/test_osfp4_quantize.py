@@ -9,7 +9,7 @@ import torch
 from compressed_tensors.offload import OffloadCache, offload_module
 
 from llmcompressor.core import Event, State
-from llmcompressor.modifiers.osfp4 import OSFP4Modifier, smoothing
+from llmcompressor.modifiers.osfp4 import OSFP4Modifier, base, smoothing
 from llmcompressor.modifiers.osfp4.base import OSFP4Mapping
 from llmcompressor.modifiers.osfp4.calibration_cache import OSFP4CalibrationCache
 from llmcompressor.modifiers.osfp4.optimization import (
@@ -231,11 +231,12 @@ def test_mapping_phases_return_fused_row_slices(monkeypatch, optimization_mode):
         lambda *_args, **_kwargs: result,
     )
     monkeypatch.setattr(
-        "llmcompressor.modifiers.osfp4.smoothing.deploy_mapping_smooth_quant_scale",
+        base,
+        "deploy_mapping_smooth_quant_scale",
         lambda _mapping, scale: scale,
     )
     monkeypatch.setattr(
-        smoothing,
+        base,
         "update_smoothed_input_global_scale",
         lambda *_args: None,
     )
@@ -406,7 +407,7 @@ def test_invalid_optimized_scales_fail_before_weight_smoothing(monkeypatch):
     assert torch.equal(mapping.smooth_layer.weight, smooth_layer_weight)
     for layer, expected in zip(mapping.balance_layers, balance_weights):
         assert torch.equal(layer.weight, expected)
-    assert mapping.mapping_name in modifier._calibration.cached_activations
+    assert mapping.mapping_name in modifier._calibration_cache.cached_activations
 
 
 @pytest.mark.parametrize("optimization_mode", ["rtn", "sic"])
@@ -420,7 +421,7 @@ def test_weight_only_uses_statistics_without_activation_replay(
     )
 
     assert modifier.activation_subsample_size is None
-    assert not modifier._calibration.cached_activations
+    assert not modifier._calibration_cache.cached_activations
     for layer in model.modules():
         if hasattr(layer, "weight_scale"):
             assert not hasattr(layer, "input_global_scale")

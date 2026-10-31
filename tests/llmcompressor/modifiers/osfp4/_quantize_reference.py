@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the OSFP4 and vLLM projects
 
-"""Frozen orchestration from checkpoint 79fb6332 for byte-exact regression tests.
+"""Frozen quantization (79fb6332) and modifier setup (70d0a9cb) references.
 
 Do not update this reference to match refactored production helpers.
 """
@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 from torch.nn import Module
 
+from llmcompressor.modifiers.osfp4 import base
 from llmcompressor.modifiers.osfp4.calibration_cache import OSFP4CalibrationCache
 from llmcompressor.modifiers.quantization.calibration import update_qparams
 
@@ -92,7 +93,8 @@ def quantize_mapping(
         quantized_weight = result.quantized_weight
     else:
         sigma_x_squared = (
-            cache.sigma_x_squared_sum[mapping.mapping_name].to(weight.device) / token_count
+            cache.sigma_x_squared_sum[mapping.mapping_name].to(weight.device)
+            / token_count
         )
         result = optimize_rtn(
             weight,
@@ -142,3 +144,160 @@ def quantize_mapping(
         deployment.append((layer, qparams))
         row_start = row_end
     return deployment
+
+
+class PreRefactorOSFP4Modifier(base.OSFP4Modifier):
+    """Initialization and capture setup frozen at 70d0a9cb.
+
+    Only private-name adapters may change; do not call the extracted helpers.
+    Other phases are covered by the frozen quantization reference above.
+    """
+
+    def on_initialize(self, state: base.State, **kwargs) -> bool:
+        self._raise_if_deployment_failed()
+        if base.is_distributed():
+            raise NotImplementedError("OSFP4 calibration is single-process")
+        pipeline = kwargs.get("pipeline")
+        if pipeline is not None and base.standardize_lookup_name(pipeline) not in (
+            "sequential",
+            "independent",
+        ):
+            raise ValueError("OSFP4 requires the sequential calibration pipeline")
+        if getattr(state, "layerwise_decompression", False) or getattr(
+            state, "layerwise_compression", False
+        ):
+            raise ValueError(
+                "OSFP4 does not support layerwise compression or decompression; "
+                "calibrate from an uncompressed model"
+            )
+        recipe = base.active_session().lifecycle.recipe
+        if recipe is not None and any(m is self for m in recipe.modifiers):
+            if len(recipe.modifiers) != 1:
+                raise ValueError("OSFP4 must be the only modifier in its recipe")
+        config = getattr(state.model, "config", None)
+        if config is not None and hasattr(config, "get_text_config"):
+            config = config.get_text_config()
+        if any(
+            getattr(config, name, 0) or 0
+            for name in (
+                "num_experts",
+                "num_local_experts",
+                "moe_num_experts",
+                "n_routed_experts",
+            )
+        ):
+            raise ValueError("OSFP4 initially supports dense models only")
+
+        self._resolved_mappings = self._resolve_mappings(state.model)
+        self._reset_calibration_state()
+        # State may contain a deep copy; count the loader the pipeline will consume.
+        self._calibration_dataloader = kwargs.get("calib_data", state.data.calib)
+        self._calibration_cache.offload_hessians = self.offload_hessians
+        base.initialize_diagonal_smoothing(
+            state.model,
+            [
+                m.mapping_name
+                for m in self._resolved_mappings
+                if m.requires_runtime_smoothing
+            ],
+        )
+        base.QuantizationMixin.initialize_quantization(self, state.model)
+        return True
+
+    def resolve_quantization_config(self) -> base.QuantizationConfig:
+        config = base.QuantizationMixin.resolve_quantization_config(self)
+        observer_kwargs = {
+            "mode": self.optimization_mode,
+            "num_iters": self.steps,
+            "lr": self.lr,
+        }
+        weight_only_groups = set()
+        for scheme in config.config_groups.values():
+            inputs = scheme.input_activations
+            expected = base.preset_name_to_scheme(
+                "NVFP4A16" if inputs is None else "NVFP4", []
+            )
+
+            def matches(actual, reference):
+                return (
+                    actual is None
+                    and reference is None
+                    or (
+                        actual is not None
+                        and reference is not None
+                        and actual.model_dump(exclude={"observer", "observer_kwargs"})
+                        == reference.model_dump(exclude={"observer", "observer_kwargs"})
+                    )
+                )
+
+            if (
+                not matches(scheme.weights, expected.weights)
+                or not matches(inputs, expected.input_activations)
+                or scheme.output_activations is not None
+            ):
+                raise ValueError("OSFP4 supports only NVFP4 and NVFP4A16 schemes")
+            weight_only_groups.add(inputs is None)
+            scheme.weights.observer = base._OSFP4_OBSERVER
+            scheme.weights.observer_kwargs = observer_kwargs.copy()
+        if len(weight_only_groups) > 1:
+            raise ValueError("OSFP4 cannot mix NVFP4 and NVFP4A16 config groups")
+        self._weight_only = next(iter(weight_only_groups), False)
+        self.weight_observer = base._OSFP4_OBSERVER
+        if self._weight_only:
+            self.activation_subsample_size = None
+        return config
+
+    def on_calibration_start(self, state: base.State, event: base.Event, **kwargs):
+        self._raise_if_deployment_failed()
+        if base.is_distributed():
+            raise NotImplementedError("OSFP4 calibration is single-process")
+        base.QuantizationMixin.start_calibration(self, state.model)
+        total_num_tokens = (
+            base.count_calibration_tokens(self._calibration_dataloader)
+            if self.activation_subsample_size is not None and not self._weight_only
+            else None
+        )
+        self._calibration_dataloader = None
+        if (
+            total_num_tokens is None
+            and state.data.calib is not None
+            and not self._weight_only
+            and self.activation_subsample_size is not None
+        ):
+            base.logger.warning(
+                "OSFP4 cannot count calibration token rows; "
+                "using full activation caching"
+            )
+        activation_subsample_sizes = [
+            self._resolve_activation_subsample_size(mapping)
+            for mapping in self._resolved_mappings
+        ]
+        for mapping, activation_subsample_size in zip(
+            self._resolved_mappings, activation_subsample_sizes
+        ):
+            subsample_during_capture = (
+                total_num_tokens is not None
+                and activation_subsample_size is not None
+                and not self._weight_only
+                and all(
+                    type(getattr(layer, "input_observer", None))
+                    is base.StaticMinMaxObserver
+                    and layer.input_observer.args.strategy
+                    == base.QuantizationStrategy.TENSOR_GROUP
+                    and layer.input_observer.args.dynamic == base.DynamicType.LOCAL
+                    for layer in mapping.balance_layers
+                )
+            )
+            self.register_hook(
+                mapping.balance_layers[0],
+                self._calibration_cache.make_capture_hook(
+                    mapping.mapping_name,
+                    optimization_mode=self.optimization_mode,
+                    cache_activations=not self._weight_only,
+                    total_num_tokens=total_num_tokens
+                    if subsample_during_capture
+                    else None,
+                    activation_subsample_size=activation_subsample_size,
+                ),
+                "forward_pre",
+            )

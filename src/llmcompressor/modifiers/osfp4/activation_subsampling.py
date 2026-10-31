@@ -1,18 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the OSFP4 and vLLM projects
 
-"""Deterministic activation-vector subsampling for OSFP4 optimization."""
+"""Token counting and deterministic activation subsampling for OSFP4 optimization."""
 
 from __future__ import annotations
 
 import hashlib
+import random
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Sequence
 
+import numpy as np
 import torch
+from torch.utils.data import IterableDataset
 
 __all__ = [
     "ActivationSubsample",
+    "count_calibration_tokens",
     "subsample_activations",
 ]
 
@@ -25,6 +30,53 @@ class ActivationSubsample:
 
     batches: tuple[torch.Tensor, ...] | None
     provenance: dict[str, int | str]
+
+
+def count_calibration_tokens(dataloader) -> int | None:
+    """Count collated token rows without model forwards or advancing RNGs."""
+    if (
+        dataloader is None
+        or isinstance(dataloader, Iterator)
+        or isinstance(getattr(dataloader, "dataset", None), IterableDataset)
+    ):
+        return None
+    # Persistent worker RNGs cannot be restored from the main process.
+    if getattr(dataloader, "persistent_workers", False):
+        return None
+    generators = {
+        generator
+        for owner in (dataloader, getattr(dataloader, "sampler", None))
+        if isinstance(
+            generator := getattr(owner, "generator", None), torch.Generator
+        )
+    }
+    generator_states = {g: g.get_state() for g in generators}
+    python_rng, numpy_rng = random.getstate(), np.random.get_state()
+    devices = (
+        list(range(torch.get_device_module("cuda").device_count()))
+        if torch.get_device_module("cuda").is_initialized()
+        else []
+    )
+    try:
+        with torch.random.fork_rng(devices=devices):
+            total_num_tokens = 0
+            for batch in dataloader:
+                if not isinstance(batch, Mapping):
+                    return None
+                inputs = batch.get("input_ids")
+                if isinstance(inputs, torch.Tensor):
+                    total_num_tokens += inputs.numel()
+                else:
+                    inputs = batch.get("inputs_embeds")
+                    if not isinstance(inputs, torch.Tensor):
+                        return None
+                    total_num_tokens += inputs.numel() // inputs.shape[-1]
+            return total_num_tokens or None
+    finally:
+        random.setstate(python_rng)
+        np.random.set_state(numpy_rng)
+        for generator, rng in generator_states.items():
+            generator.set_state(rng)
 
 
 def _select_activation_indices(

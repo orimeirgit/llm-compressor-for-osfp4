@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the OSFP4 and vLLM projects
 
-"""Compose production phases for mapping-level tests."""
+"""Run production deployment while retaining parameters for phase comparisons."""
 
-from llmcompressor.modifiers.osfp4 import base, osfp4_quantize, smoothing
+from unittest.mock import patch
+
+from llmcompressor.modifiers.osfp4 import base, osfp4_quantize
 
 
 def run_phases(
@@ -23,7 +25,18 @@ def run_phases(
         weight_only=weight_only,
         sampled_activations=sampled_activations,
     )
-    scale = smoothing.deploy_mapping_smooth_quant_scale(mapping, result.alpha)
-    if not weight_only:
-        smoothing.update_smoothed_input_global_scale(mapping, cache, scale)
-    return base.prepare_mapping_parameters(mapping, result)
+    modifier = base.OSFP4Modifier(
+        scheme="NVFP4A16" if weight_only else "NVFP4",
+        optimization_mode=optimization_mode,
+    )
+    modifier._calibration_cache = cache
+    modifier._weight_only = weight_only
+    deployment = {}
+
+    def record_parameter(layer, name, value):
+        deployment.setdefault(layer, {})[name] = value
+
+    # Keep smoothing writes, but defer parameter installation to the test caller.
+    with patch.object(base, "update_offload_parameter", record_parameter):
+        modifier._deploy_mapping(mapping, result)
+    return list(deployment.items())

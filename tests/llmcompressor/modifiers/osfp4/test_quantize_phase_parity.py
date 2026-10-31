@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the OSFP4 and vLLM projects
 
-"""Byte-exact parity against orchestration frozen at checkpoint 79fb6332."""
+"""Byte-exact parity against quantization (79fb6332) and setup (70d0a9cb)."""
 
 import json
 from contextlib import ExitStack
@@ -15,7 +15,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 from llmcompressor.args import DatasetArguments
 from llmcompressor.core import create_session
-from llmcompressor.modifiers.osfp4 import OSFP4Modifier, osfp4_quantize
+from llmcompressor.modifiers.osfp4 import OSFP4Modifier, base, osfp4_quantize
 from llmcompressor.modifiers.osfp4.base import OSFP4Mapping
 from llmcompressor.modifiers.osfp4.calibration_cache import OSFP4CalibrationCache
 from llmcompressor.modifiers.osfp4.transforms import initialize_diagonal_smoothing
@@ -62,6 +62,25 @@ def snapshot(model):
     return {
         name: value.detach().cpu().clone() for name, value in model.state_dict().items()
     }
+
+
+def assert_tree_bytes(actual, expected, path="snapshot"):
+    if isinstance(expected, torch.Tensor):
+        try:
+            assert_bytes(actual, expected)
+        except AssertionError as error:
+            raise AssertionError(f"Tensor bytes differ: {path}") from error
+    elif isinstance(expected, dict):
+        assert actual.keys() == expected.keys(), path
+        for key in expected:
+            assert_tree_bytes(actual[key], expected[key], f"{path}.{key}")
+    elif isinstance(expected, (tuple, list)):
+        assert type(actual) is type(expected), path
+        assert len(actual) == len(expected), path
+        for index, (value, reference_value) in enumerate(zip(actual, expected)):
+            assert_tree_bytes(value, reference_value, f"{path}[{index}]")
+    else:
+        assert actual == expected, path
 
 
 @pytest.mark.parametrize("optimization_mode", ["rtn", "sic"])
@@ -182,13 +201,13 @@ def test_mapping_phases_match_reference_bytes(
 
 def reference_optimize_mapping(self, mapping):
     """Baseline successful modifier path; no refactored phase helpers."""
-    self._require_usable()
+    self._raise_if_deployment_failed()
     if mapping.mapping_name in self._optimized_mapping_names:
         return
-    sampled = self._sample_optimization_activations(mapping)
+    sampled = self._prepare_optimization_activations(mapping)
     deployment = reference.quantize_mapping(
         mapping,
-        self._calibration,
+        self._calibration_cache,
         optimization_mode=self.optimization_mode,
         dampening_frac=self.dampening_frac,
         weight_only=self._weight_only,
@@ -198,22 +217,33 @@ def reference_optimize_mapping(self, mapping):
         for name, value in qparams.items():
             update_offload_parameter(layer, name, value)
     self._optimized_mapping_names.add(mapping.mapping_name)
-    self._calibration.clear_mapping(mapping.mapping_name)
+    self._calibration_cache.clear_mapping(mapping.mapping_name)
 
 
 @pytest.mark.parametrize("optimization_mode", ["rtn", "sic"])
+@pytest.mark.parametrize("reference_phase", ["quantization", "setup"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("offload_hessians", [False, True])
 @pytest.mark.parametrize(
     "scheme,policy",
     [
         ("NVFP4", "full"),
         ("NVFP4", "sampled"),
         ("NVFP4", "streaming"),
+        ("NVFP4", "fixed"),
         ("NVFP4A16", "full"),
     ],
 )
 @pytest.mark.parametrize("device", DEVICES)
 def test_sequential_export_matches_reference_bytes(
-    optimization_mode, scheme, policy, device, tmp_path
+    optimization_mode,
+    reference_phase,
+    dtype,
+    offload_hessians,
+    scheme,
+    policy,
+    device,
+    tmp_path,
 ):
     def execute(legacy):
         torch.manual_seed(42)
@@ -227,24 +257,30 @@ def test_sequential_export_matches_reference_bytes(
             use_cache=False,
         )
         config._attn_implementation = "eager"
-        model = LlamaForCausalLM(config).to(device=device, dtype=torch.bfloat16).eval()
+        model = LlamaForCausalLM(config).to(device=device, dtype=dtype).eval()
         generator = torch.Generator().manual_seed(0)
         samples = [
             {"input_ids": torch.randint(0, 64, (1, 16), generator=generator)}
             for _ in range(5)
         ]
         loader = torch.utils.data.DataLoader(samples, batch_size=None)
-        modifier = OSFP4Modifier(
+        modifier_class = (
+            reference.PreRefactorOSFP4Modifier
+            if legacy and reference_phase == "setup"
+            else OSFP4Modifier
+        )
+        modifier = modifier_class(
             scheme=scheme,
             optimization_mode=optimization_mode,
             ignore=["lm_head"],
             steps=2,
+            offload_hessians=offload_hessians,
             activation_subsample_size="auto"
             if policy == "streaming"
-            else (7 if policy == "sampled" else None),
+            else (7 if policy in ("sampled", "fixed") else None),
         )
         with ExitStack() as stack:
-            if legacy:
+            if legacy and reference_phase == "quantization":
                 stack.enter_context(
                     patch.object(
                         OSFP4Modifier, "_optimize_mapping", reference_optimize_mapping
@@ -253,7 +289,7 @@ def test_sequential_export_matches_reference_bytes(
             if policy == "sampled":
                 stack.enter_context(
                     patch.object(
-                        OSFP4Modifier, "_calibration_token_count", return_value=None
+                        base, "count_calibration_tokens", return_value=None
                     )
                 )
             stack.enter_context(
@@ -265,6 +301,16 @@ def test_sequential_export_matches_reference_bytes(
             session.initialize(
                 model=model, recipe=[modifier], start=-1, calib_data=loader
             )
+            module_names = {module: name for name, module in model.named_modules()}
+            mappings = [
+                (
+                    mapping.mapping_name,
+                    module_names.get(mapping.smooth_layer),
+                    tuple(module_names[layer] for layer in mapping.balance_layers),
+                )
+                for mapping in modifier._resolved_mappings
+            ]
+            initialized_state = snapshot(model)
             CalibrationPipeline.from_modifiers([modifier])(
                 model,
                 loader,
@@ -280,8 +326,11 @@ def test_sequential_export_matches_reference_bytes(
                     .logits.cpu()
                     .clone()
                 )
+            state_before_finalize = snapshot(model)
             session.finalize()
+            modifier.on_finalize(session.state)
         state = snapshot(model)
+        assert_state(state, state_before_finalize)
         with torch.no_grad():
             output = (
                 model(input_ids=samples[0]["input_ids"].to(device)).logits.cpu().clone()
@@ -291,18 +340,30 @@ def test_sequential_export_matches_reference_bytes(
         model.save_pretrained(folder, save_compressed=True)
         exported = load_file(str(folder / "model.safetensors"))
         config = json.loads((folder / "config.json").read_text())
-        return (
-            state,
-            before_finalize,
-            output,
-            exported,
-            config,
-            modifier.activation_subsampling_records,
+        assert_bytes(output, before_finalize)
+        cache = modifier._calibration_cache
+        assert not modifier._resolved_mappings
+        assert modifier._finalization_complete
+        assert not any(
+            value for name, value in vars(cache).items() if name != "offload_hessians"
         )
+        return {
+            "mappings": mappings,
+            "initialized_state": initialized_state,
+            "state_before_finalize": state_before_finalize,
+            "state": state,
+            "before_finalize": before_finalize,
+            "output": output,
+            "exported": exported,
+            "config": config,
+            "sampling_records": modifier.activation_subsampling_records,
+            "optimized_mapping_names": sorted(modifier._optimized_mapping_names),
+            "hook_counts": {
+                name: (len(layer._forward_pre_hooks), len(layer._forward_hooks))
+                for name, layer in model.named_modules()
+            },
+            "rng": torch.get_rng_state().clone(),
+        }
 
     old, new = execute(True), execute(False)
-    assert_state(new[0], old[0])
-    assert_bytes(new[1], old[1])
-    assert_bytes(new[2], old[2])
-    assert_state(new[3], old[3])
-    assert new[4:] == old[4:]
+    assert_tree_bytes(new, old)
