@@ -83,10 +83,10 @@ def update_smoothed_input_global_scale(
     """Update input global scales from smoothed calibration statistics."""
     # Replay reads pinned CPU buffers on the host; finish their D2H copies.
     cache.wait(mapping.mapping_name, torch.device("cpu"))
-    replay_inputs = cache.inputs[mapping.mapping_name]
-    if mapping.mapping_name in cache.input_absmax:
+    replay_inputs = cache.cached_activations[mapping.mapping_name]
+    if mapping.mapping_name in cache.input_channel_absmax:
         # Recalibrate from one row of per-channel maxima collected over all tokens.
-        maximum = cache.input_absmax[mapping.mapping_name].cpu()
+        maximum = cache.input_channel_absmax[mapping.mapping_name].cpu()
         replay_inputs = (maximum.unsqueeze(0),)
 
     layers = mapping.balance_layers

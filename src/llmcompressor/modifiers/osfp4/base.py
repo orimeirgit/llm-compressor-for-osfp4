@@ -209,11 +209,11 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         covered = {layer for mapping in mappings for layer in mapping.balance_layers}
         mappings.extend(
             OSFP4Mapping(
-                mapping_name=name,
+                mapping_name=mapping_name,
                 smooth_layer=None,
                 balance_layers=(layer,),
             )
-            for name, layer in selected
+            for mapping_name, layer in selected
             if layer not in covered
         )
         logger.info(
@@ -374,14 +374,14 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         if is_distributed():
             raise NotImplementedError("OSFP4 calibration is single-process")
         QuantizationMixin.start_calibration(self, state.model)
-        expected_tokens = (
+        total_num_tokens = (
             self._calibration_token_count(self._calibration_dataloader)
             if self.activation_subsample_size is not None and not self._weight_only
             else None
         )
         self._calibration_dataloader = None
         if (
-            expected_tokens is None
+            total_num_tokens is None
             and state.data.calib is not None
             and not self._weight_only
             and self.activation_subsample_size is not None
@@ -396,7 +396,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         ]
         for mapping, subsample_size in zip(self._resolved_mappings, subsample_sizes):
             streaming = (
-                expected_tokens is not None
+                total_num_tokens is not None
                 and subsample_size is not None
                 and not self._weight_only
                 and all(
@@ -414,7 +414,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
                     capture_hessian=self.optimization_mode == "sic",
                     cache_inputs=not self._weight_only,
                     capture_sigma_x_squared=self.optimization_mode == "rtn",
-                    expected_tokens=expected_tokens if streaming else None,
+                    total_num_tokens=total_num_tokens if streaming else None,
                     subsample_size=subsample_size,
                 ),
                 "forward_pre",
@@ -469,16 +469,16 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         if subsample_size is None:
             return None
 
-        # Synchronize D2H capture before sampling CPU rows from pinned buffers.
-        self._calibration.wait(mapping.mapping_name, torch.device("cpu"))
         output_rows = sum(layer.weight.shape[0] for layer in mapping.balance_layers)
-        if mapping.mapping_name in self._calibration.sample_indices:
-            selection = self._calibration.sampled_inputs(
+        if mapping.mapping_name in self._calibration.sampled_indices:
+            selection = self._calibration.prepare_sampled_activations(
                 mapping.mapping_name, output_rows
             )
         else:
+            # Finish D2H capture before sampling the cached CPU rows.
+            self._calibration.wait(mapping.mapping_name, torch.device("cpu"))
             selection = subsample_activations(
-                self._calibration.inputs[mapping.mapping_name],
+                self._calibration.cached_activations[mapping.mapping_name],
                 subsample_size,
                 output_rows=output_rows,
             )
@@ -582,6 +582,6 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
     def activation_subsampling_records(self) -> dict[str, dict[str, int | str]]:
         """Return JSON-serializable sampling provenance for optimized mappings."""
         return {
-            name: record.copy()
-            for name, record in self._activation_subsampling_records.items()
+            mapping_name: record.copy()
+            for mapping_name, record in self._activation_subsampling_records.items()
         }

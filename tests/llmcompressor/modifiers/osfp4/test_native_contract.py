@@ -28,7 +28,7 @@ def test_finalize_preserves_smoothing_and_clears_capture_state(mode, scheme):
     modifier.on_finalize(State(model=model))
     torch.testing.assert_close(model(x), expected, rtol=0, atol=0)
     assert list(layer._forward_pre_hooks) == before_hooks
-    assert not modifier._calibration.inputs
+    assert not modifier._calibration.cached_activations
     assert not modifier._resolved_mappings
     assert isinstance(model.transform_config, TransformConfig)
 

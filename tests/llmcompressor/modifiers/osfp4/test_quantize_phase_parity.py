@@ -105,13 +105,13 @@ def test_mapping_phases_match_reference_bytes(mode, dtype, layout, policy, offlo
             else None
         )
         cache = OSFP4CalibrationCache(
-            inputs={}
+            cached_activations={}
             if policy == "weight_only"
             else {"mapping": list(sampled) if policy == "extrema" else batches},
             hessian={"mapping": rows.float().T @ rows.float()},
             sigma_x_squared={"mapping": rows.float().square().sum(0)},
-            sample_count={"mapping": rows.shape[0]},
-            input_absmax={"mapping": rows.float().abs().amax(0)}
+            token_count={"mapping": rows.shape[0]},
+            input_channel_absmax={"mapping": rows.float().abs().amax(0)}
             if policy == "extrema"
             else {},
         )

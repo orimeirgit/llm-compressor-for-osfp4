@@ -85,9 +85,11 @@ def test_automatic_count_uses_collated_rows_and_preserves_rng(embeddings):
 
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("cap", [3, 11, 20])
-def test_capture_matches_legacy_bytes_and_statistics(device, cap):
+@pytest.mark.parametrize("batch_rows", [(6, 5), (0, 2, 0, 9), (1, 1, 1, 8)])
+def test_capture_matches_legacy_bytes_and_statistics(device, cap, batch_rows):
     batches = [
-        torch.randn(n, 16, generator=torch.Generator().manual_seed(n)) for n in (6, 5)
+        torch.randn(n, 16, generator=torch.Generator().manual_seed(n))
+        for n in batch_rows
     ]
     batches[0][:, 0] = -0.0
     expected = subsample_activations(batches, cap, output_rows=4)
@@ -97,7 +99,7 @@ def test_capture_matches_legacy_bytes_and_statistics(device, cap):
         "x",
         capture_hessian=True,
         capture_sigma_x_squared=True,
-        expected_tokens=11,
+        total_num_tokens=11,
         subsample_size=cap,
     )
     hessian, energy = torch.zeros(16, 16, device=device), torch.zeros(16, device=device)
@@ -107,23 +109,23 @@ def test_capture_matches_legacy_bytes_and_statistics(device, cap):
         hook(layer, (value,))
         hessian.addmm_(value.T, value)
         energy.add_(value.square().sum(0))
-        assert sum(x.shape[0] for x in cache.inputs.get("x", ())) <= cap
+        assert sum(x.shape[0] for x in cache.cached_activations.get("x", ())) <= cap
     cache.wait("x", torch.device("cpu"))
-    actual = cache.sampled_inputs("x", output_rows=4)
+    actual = cache.prepare_sampled_activations("x", output_rows=4)
     assert actual.provenance == expected.provenance
     assert_bytes(
-        torch.cat(actual.batches or cache.inputs["x"]),
+        torch.cat(actual.batches or cache.cached_activations["x"]),
         torch.cat(expected.batches or batches),
     )
     assert_bytes(cache.hessian["x"], hessian)
     assert_bytes(cache.sigma_x_squared["x"], energy)
-    assert_bytes(cache.input_absmax["x"], torch.cat(batches).abs().amax(0))
+    assert_bytes(cache.input_channel_absmax["x"], torch.cat(batches).abs().amax(0))
     assert torch.equal(rng, torch.get_rng_state())
     cache.clear_mapping("x")
     assert (
-        not cache.sample_indices
-        and not cache.expected_tokens
-        and not cache.input_absmax
+        not cache.sampled_indices
+        and not cache.total_num_tokens
+        and not cache.input_channel_absmax
     )
 
 
@@ -186,10 +188,12 @@ def test_existing_capture_fallback(fallback):
     modifier.on_calibration_start(state, Event())
     try:
         model(torch.randn(1, 11, 16))
-        assert not modifier._calibration.sample_indices
-        for batches in modifier._calibration.inputs.values():
+        assert not modifier._calibration.sampled_indices
+        for batches in modifier._calibration.cached_activations.values():
             assert sum(batch.shape[0] for batch in batches) == 11
-        assert bool(modifier._calibration.inputs) == (fallback != "weight_only")
+        assert bool(modifier._calibration.cached_activations) == (
+            fallback != "weight_only"
+        )
     finally:
         modifier.remove_hooks()
 
@@ -273,7 +277,7 @@ def test_pipeline_and_saved_checkpoint_byte_parity(tmp_path, device, dtype, mode
         assert capture.call_args_list
         total = next(iter(modifier.activation_subsampling_records.values()))["k1"]
         assert all(
-            call.kwargs["expected_tokens"] == (total if streaming else None)
+            call.kwargs["total_num_tokens"] == (total if streaming else None)
             for call in capture.call_args_list
         )
         state = {
@@ -335,7 +339,9 @@ def test_auto_matches_fixed_twice_input_width_for_streaming_and_fallback(rows, w
                         batches = modifier._sample_optimization_inputs(mapping)
                         selected[mapping.mapping_name] = torch.cat(
                             batches
-                            or modifier._calibration.inputs[mapping.mapping_name]
+                            or modifier._calibration.cached_activations[
+                                mapping.mapping_name
+                            ]
                         )
                         record = modifier.activation_subsampling_records[
                             mapping.mapping_name
@@ -353,9 +359,9 @@ def test_auto_matches_fixed_twice_input_width_for_streaming_and_fallback(rows, w
         (auto_fallback, fixed_fallback),
         (auto_streaming, fixed_streaming),
     ):
-        for name, tensor in auto[2].items():
-            assert_bytes(tensor, fixed[2][name], name)
-            record = dict(auto[3][name])
+        for mapping_name, tensor in auto[2].items():
+            assert_bytes(tensor, fixed[2][mapping_name], mapping_name)
+            record = dict(auto[3][mapping_name])
             del record["n"]
             record["policy"] = "fixed"
-            assert record == fixed[3][name]
+            assert record == fixed[3][mapping_name]

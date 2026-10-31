@@ -93,10 +93,10 @@ def test_mapping_phases_reuse_attached_observer(
         optimize,
     )
     cache = OSFP4CalibrationCache(
-        inputs={} if weight_only else {"mapping": [torch.ones(4, 16)]},
+        cached_activations={} if weight_only else {"mapping": [torch.ones(4, 16)]},
         hessian={"mapping": torch.eye(16)},
         sigma_x_squared={"mapping": torch.arange(1, 17, dtype=torch.float32)},
-        sample_count={"mapping": 4},
+        token_count={"mapping": 4},
     )
     original_cat = torch.cat
 
@@ -124,7 +124,9 @@ def test_mapping_phases_reuse_attached_observer(
 
     assert events[:3] == ["cat", "wait", "optimize"]
     assert _tensor_bytes(seen["args"][0]) == _tensor_bytes(original_weight)
-    expected_batches = sampled if sampled is not None else cache.inputs.get("mapping")
+    expected_batches = (
+        sampled if sampled is not None else cache.cached_activations.get("mapping")
+    )
     assert seen["args"][1] is expected_batches
     assert seen["kwargs"]["observer"] is attached_observer
     assert seen["kwargs"]["alpha_dtype"] is (torch.bfloat16 if runtime else dtype)
@@ -238,10 +240,10 @@ def test_mapping_phases_return_fused_row_slices(monkeypatch, mode):
         lambda *_args: None,
     )
     cache = OSFP4CalibrationCache(
-        inputs={"mapping": [torch.ones(1, 16)]},
+        cached_activations={"mapping": [torch.ones(1, 16)]},
         hessian={"mapping": torch.eye(16)},
         sigma_x_squared={"mapping": torch.ones(16)},
-        sample_count={"mapping": 1},
+        token_count={"mapping": 1},
     )
 
     deployment = run_phases(
@@ -317,7 +319,7 @@ def test_smoothed_input_replay_updates_every_target(monkeypatch, missing_statist
         for index, observer in enumerate(observers)
     ]
     mapping = OSFP4Mapping("mapping", None, layers)
-    cache = OSFP4CalibrationCache(inputs={"mapping": list(batches)})
+    cache = OSFP4CalibrationCache(cached_activations={"mapping": list(batches)})
     smoothing.update_smoothed_input_global_scale(mapping, cache, scale)
     for handle in handles:
         handle.remove()
@@ -346,19 +348,19 @@ def test_extrema_recalibration_matches_full_and_two_row_global_scale(dtype, case
     scale = torch.linspace(0.125, 8, 16).to(torch.bfloat16).float()
     maximum = rows.float().abs().amax(0)
 
-    cache = OSFP4CalibrationCache(inputs={"mapping": list(rows.split(2))})
+    cache = OSFP4CalibrationCache(cached_activations={"mapping": list(rows.split(2))})
     smoothing.update_smoothed_input_global_scale(mapping, cache, scale)
     full_scale = layer.input_global_scale.clone()
     cache = OSFP4CalibrationCache(
-        inputs={"mapping": [torch.stack((-maximum, maximum))]}
+        cached_activations={"mapping": [torch.stack((-maximum, maximum))]}
     )
     smoothing.update_smoothed_input_global_scale(mapping, cache, scale)
     two_row_scale = layer.input_global_scale.clone()
 
     # The retained sample misses the extrema; recalibration must use all-token maxima.
     cache = OSFP4CalibrationCache(
-        inputs={"mapping": [rows[:1]]},
-        input_absmax={"mapping": maximum},
+        cached_activations={"mapping": [rows[:1]]},
+        input_channel_absmax={"mapping": maximum},
     )
     smoothing.update_smoothed_input_global_scale(mapping, cache, scale)
     actual = layer.input_global_scale
@@ -404,7 +406,7 @@ def test_invalid_optimized_scales_fail_before_weight_smoothing(monkeypatch):
     assert torch.equal(mapping.smooth_layer.weight, smooth_layer_weight)
     for layer, expected in zip(mapping.balance_layers, balance_weights):
         assert torch.equal(layer.weight, expected)
-    assert mapping.mapping_name in modifier._calibration.inputs
+    assert mapping.mapping_name in modifier._calibration.cached_activations
 
 
 @pytest.mark.parametrize("mode", ["rtn", "sic"])
@@ -416,7 +418,7 @@ def test_weight_only_uses_statistics_without_activation_replay(monkeypatch, mode
     )
 
     assert modifier.activation_subsample_size is None
-    assert not modifier._calibration.inputs
+    assert not modifier._calibration.cached_activations
     for layer in model.modules():
         if hasattr(layer, "weight_scale"):
             assert not hasattr(layer, "input_global_scale")

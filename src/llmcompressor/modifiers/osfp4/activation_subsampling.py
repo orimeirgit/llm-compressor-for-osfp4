@@ -27,6 +27,33 @@ class ActivationSubsample:
     provenance: dict[str, int | str]
 
 
+def _select_activation_indices(total_tokens: int, requested_size: int) -> torch.Tensor:
+    """Select sorted activation indices without changing global RNG state."""
+    size = min(total_tokens, requested_size)
+    if size == total_tokens:
+        return torch.arange(total_tokens, device="cpu", dtype=torch.int64)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(_ACTIVATION_SUBSAMPLE_SEED)
+    indices = torch.randperm(
+        total_tokens, generator=generator, device="cpu", dtype=torch.int64
+    )[:size]
+    return indices.sort().values
+
+
+def _build_subsample_provenance(
+    indices: torch.Tensor, total_tokens: int, output_rows: int
+) -> dict[str, int | str]:
+    """Describe the selected activation rows and their source."""
+    return {
+        "policy": "fixed",
+        "seed": _ACTIVATION_SUBSAMPLE_SEED,
+        "m": output_rows,
+        "k": indices.numel(),
+        "k1": total_tokens,
+        "index_sha256": hashlib.sha256(indices.numpy().tobytes()).hexdigest(),
+    }
+
+
 def _gather_rows(
     batches: Sequence[torch.Tensor],
     indices: torch.Tensor,
@@ -74,28 +101,13 @@ def subsample_activations(
         total_tokens += batch.shape[0]
         all_pinned = all_pinned and batch.is_pinned()
 
-    size = min(total_tokens, requested_size)
-
-    if size == total_tokens:
-        indices = torch.arange(total_tokens, device="cpu", dtype=torch.int64)
+    indices = _select_activation_indices(total_tokens, requested_size)
+    if indices.numel() == total_tokens:
         selected = None  # Reuse all original batches without copying.
     else:
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(_ACTIVATION_SUBSAMPLE_SEED)
-        indices = torch.randperm(
-            total_tokens, generator=generator, device="cpu", dtype=torch.int64
-        )[:size]
-        indices = indices.sort().values
         selected = (_gather_rows(batches, indices, pin_memory=all_pinned),)
 
     return ActivationSubsample(
         batches=selected,
-        provenance={
-            "policy": "fixed",
-            "seed": _ACTIVATION_SUBSAMPLE_SEED,
-            "m": output_rows,
-            "k": size,
-            "k1": total_tokens,
-            "index_sha256": hashlib.sha256(indices.numpy().tobytes()).hexdigest(),
-        },
+        provenance=_build_subsample_provenance(indices, total_tokens, output_rows),
     )

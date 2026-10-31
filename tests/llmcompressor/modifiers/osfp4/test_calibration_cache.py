@@ -67,8 +67,8 @@ def test_capture_preserves_exact_statistics_and_input_bytes(
         expected_inputs.append(flat.cpu().clone())
         hook(layer, (batch,))
 
-    assert cache.sample_count["mapping"] == 15
-    assert "mapping" not in cache.events
+    assert cache.token_count["mapping"] == 15
+    assert "mapping" not in cache.capture_events
     if capture_hessian:
         assert _tensor_bytes(cache.hessian["mapping"]) == _tensor_bytes(
             expected_hessian
@@ -84,18 +84,18 @@ def test_capture_preserves_exact_statistics_and_input_bytes(
         assert "mapping" not in cache.sigma_x_squared
     if cache_inputs:
         for cached, expected, source in zip(
-            cache.inputs["mapping"], expected_inputs, batches
+            cache.cached_activations["mapping"], expected_inputs, batches
         ):
             assert cached.data_ptr() != source.data_ptr()
             assert cached.dtype == expected.dtype
             assert _tensor_bytes(cached) == _tensor_bytes(expected)
         with torch.no_grad():
             batches[0].fill_(42)
-        assert _tensor_bytes(cache.inputs["mapping"][0]) == _tensor_bytes(
+        assert _tensor_bytes(cache.cached_activations["mapping"][0]) == _tensor_bytes(
             expected_inputs[0]
         )
     else:
-        assert "mapping" not in cache.inputs
+        assert "mapping" not in cache.cached_activations
 
 
 @pytest.mark.parametrize("cache_inputs", [False, True])
@@ -111,13 +111,13 @@ def test_empty_capture_preserves_readiness_semantics(cache_inputs):
         capture_sigma_x_squared=True,
     )(layer, (batch,))
 
-    assert cache.sample_count["mapping"] == 0
+    assert cache.token_count["mapping"] == 0
     assert _tensor_bytes(cache.hessian["mapping"]) == _tensor_bytes(torch.zeros(16, 16))
     assert _tensor_bytes(cache.sigma_x_squared["mapping"]) == _tensor_bytes(
         torch.zeros(16)
     )
     assert cache.has_observation("mapping") is cache_inputs
-    assert "mapping" not in cache.events
+    assert "mapping" not in cache.capture_events
 
 
 def test_cleanup_preserves_other_mappings_and_clears_streams():
@@ -127,16 +127,16 @@ def test_cleanup_preserves_other_mappings_and_clears_streams():
         "first", capture_hessian=True, capture_sigma_x_squared=True
     )
     hook(layer, (torch.randn(2, 16),))
-    cache.inputs["second"] = [torch.ones(1, 16)]
-    cache.events["second"] = {}
-    cache.sample_count["second"] = 1
+    cache.cached_activations["second"] = [torch.ones(1, 16)]
+    cache.capture_events["second"] = {}
+    cache.token_count["second"] = 1
     cache.capture_streams[torch.device("cuda")] = object()
 
     cache.clear_mapping("first")
 
-    assert set(cache.inputs) == {"second"}
-    assert set(cache.events) == {"second"}
-    assert set(cache.sample_count) == {"second"}
+    assert set(cache.cached_activations) == {"second"}
+    assert set(cache.capture_events) == {"second"}
+    assert set(cache.token_count) == {"second"}
     assert not cache.hessian
     assert not cache.sigma_x_squared
     assert cache.capture_streams
@@ -145,11 +145,11 @@ def test_cleanup_preserves_other_mappings_and_clears_streams():
 
     assert not any(
         (
-            cache.inputs,
-            cache.events,
+            cache.cached_activations,
+            cache.capture_events,
             cache.hessian,
             cache.sigma_x_squared,
-            cache.sample_count,
+            cache.token_count,
             cache.capture_streams,
         )
     )
@@ -170,7 +170,7 @@ def test_wait_uses_consumer_stream_or_host_synchronization(monkeypatch):
             calls.append(("wait_event", event.name))
 
     cache = OSFP4CalibrationCache(
-        events={
+        capture_events={
             "mapping": {
                 torch.device("cuda:0"): Event("first"),
                 torch.device("cuda:1"): Event("second"),
@@ -228,7 +228,7 @@ def test_calibration_cache_accumulates_raw_osfp4_hessian():
 
     torch.testing.assert_close(cache.hessian["mapping"], expected_H)
     assert not torch.allclose(cache.hessian["mapping"], 2.0 * expected_H)
-    assert [tuple(value.shape) for value in cache.inputs["mapping"]] == [
+    assert [tuple(value.shape) for value in cache.cached_activations["mapping"]] == [
         (6, 16),
         (5, 16),
     ]
@@ -244,7 +244,7 @@ def test_calibration_cache_clears_hessian_state():
     assert cache.hessian["mapping"].device.type == "cpu"
     cache.clear_mapping("mapping")
 
-    assert "mapping" not in cache.inputs
+    assert "mapping" not in cache.cached_activations
     assert "mapping" not in cache.hessian
 
 
@@ -255,7 +255,7 @@ def test_calibration_cache_does_not_duplicate_activation_statistics():
         module, (torch.randn(2, 3, 16),)
     )
 
-    assert "mapping" in cache.inputs
+    assert "mapping" in cache.cached_activations
     assert not hasattr(cache, "channel_absmax")
 
 
@@ -281,9 +281,9 @@ def test_weight_only_rtn_streams_sigma_x_squared_without_raw_inputs():
         cache.sigma_x_squared["mapping"],
         concatenated.square().sum(dim=0),
     )
-    assert cache.sample_count["mapping"] == concatenated.shape[0]
+    assert cache.token_count["mapping"] == concatenated.shape[0]
     assert cache.has_observation("mapping")
-    assert "mapping" not in cache.inputs
+    assert "mapping" not in cache.cached_activations
     assert "mapping" not in cache.hessian
 
 
@@ -309,8 +309,8 @@ def test_nvfp4_rtn_streams_sigma_x_squared_with_raw_inputs():
         cache.sigma_x_squared["mapping"],
         concatenated.square().sum(dim=0),
     )
-    assert len(cache.inputs["mapping"]) == len(batches)
-    assert cache.sample_count["mapping"] == concatenated.shape[0]
+    assert len(cache.cached_activations["mapping"]) == len(batches)
+    assert cache.token_count["mapping"] == concatenated.shape[0]
     assert "mapping" not in cache.hessian
 
 
@@ -324,10 +324,177 @@ def test_weight_only_sic_streams_hessian_without_raw_inputs():
         cache_inputs=False,
     )(module, (batch,))
 
-    assert "mapping" not in cache.inputs
+    assert "mapping" not in cache.cached_activations
     assert "mapping" not in cache.sigma_x_squared
-    assert cache.sample_count["mapping"] == 6
+    assert cache.token_count["mapping"] == 6
     torch.testing.assert_close(
         cache.hessian["mapping"],
         batch.reshape(-1, 16).T @ batch.reshape(-1, 16),
     )
+
+
+@pytest.mark.parametrize("retain_all", [False, True])
+@pytest.mark.parametrize("single_batch", [False, True])
+def test_prepare_sampled_activations_waits_for_pending_cpu_buffers(retain_all, single_batch):
+    indices = torch.arange(5) if retain_all else torch.tensor([1, 3])
+    expected = torch.arange(indices.numel() * 16, dtype=torch.float32).reshape(-1, 16)
+    source_batches = (expected,) if single_batch else expected.split(1)
+    batches = [torch.full_like(batch, -1) for batch in source_batches]
+
+    class PendingCopy:
+        def synchronize(self):
+            for destination, source in zip(batches, source_batches):
+                destination.copy_(source)
+
+    cache = OSFP4CalibrationCache(
+        cached_activations={"mapping": batches},
+        capture_events={"mapping": {torch.device("cuda:0"): PendingCopy()}},
+        sampled_indices={"mapping": indices},
+        total_num_tokens={"mapping": 5},
+        token_count={"mapping": 5},
+    )
+    result = cache.prepare_sampled_activations("mapping", output_rows=4)
+    actual = torch.cat(result.batches or cache.cached_activations["mapping"])
+    assert _tensor_bytes(actual) == _tensor_bytes(expected)
+    assert (result.batches is None) is retain_all
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["single", "strided", "multiple"])
+@pytest.mark.parametrize("retain_all", [False, True])
+@pytest.mark.parametrize(
+    "pinned",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not torch.get_device_module("cuda").is_available(),
+                reason="Pinned memory requires CUDA",
+            ),
+        ),
+    ],
+)
+def test_prepare_sampled_activations_preserves_layout_values_and_cache_ownership(
+    dtype, layout, retain_all, pinned
+):
+    total = 9
+    indices = torch.arange(total) if retain_all else torch.tensor([0, 2, 4, 7])
+    expected = torch.arange(indices.numel() * 16, dtype=dtype).reshape(-1, 16)
+    expected[0, 0] = -0.0
+    source = torch.empty(
+        (indices.numel(), 32 if layout == "strided" else 16),
+        dtype=dtype,
+        pin_memory=pinned,
+    )
+    if layout == "strided":
+        source = source[:, ::2]
+    source.copy_(expected)
+    batches = list(source.split(2)) if layout == "multiple" else [source]
+    cache = OSFP4CalibrationCache(
+        cached_activations={"mapping": batches},
+        sampled_indices={"mapping": indices},
+        total_num_tokens={"mapping": total},
+        token_count={"mapping": total},
+    )
+    first = cache.prepare_sampled_activations("mapping", output_rows=4)
+    second = cache.prepare_sampled_activations("mapping", output_rows=4)
+    assert first.provenance == second.provenance
+    if retain_all:
+        assert first.batches is second.batches is None
+        assert cache.cached_activations["mapping"] is batches
+        actual = torch.cat(batches)
+    else:
+        actual = first.batches[0]
+        assert actual is second.batches[0] is cache.cached_activations["mapping"][0]
+        assert actual.is_contiguous()
+        assert actual.is_pinned() is pinned
+        assert (actual is source) is (layout == "single")
+    assert actual.shape == expected.shape
+    assert actual.dtype == expected.dtype
+    assert _tensor_bytes(actual) == _tensor_bytes(expected)
+    assert all(
+        batch.is_pinned() is pinned for batch in cache.cached_activations["mapping"]
+    )
+
+
+@pytest.mark.parametrize(
+    "offload, failure",
+    [
+        (False, stage)
+        for stage in ("allocation", "before_accumulation", "after_accumulation")
+    ]
+    + [
+        (True, stage)
+        for stage in (
+            "allocation",
+            "onload",
+            "before_accumulation",
+            "after_accumulation",
+            "offload",
+        )
+    ],
+)
+def test_hessian_capture_failure_preserves_partial_cache(monkeypatch, offload, failure):
+    from llmcompressor.modifiers.osfp4 import calibration_cache
+
+    cache = OSFP4CalibrationCache(offload_hessians=offload)
+    layer = torch.nn.Linear(16, 4)
+    inputs = torch.arange(48, dtype=torch.float32).reshape(3, 16)
+    buffers = []
+    transfers = []
+    error = RuntimeError("injected capture failure")
+    allocate = calibration_cache.make_empty_hessian
+    accumulate = calibration_cache.accumulate_hessian
+    tensor_to = torch.Tensor.to
+
+    def allocate_hessian(*args, **kwargs):
+        if failure == "allocation":
+            raise error
+        hessian = allocate(*args, **kwargs)
+        buffers.append(hessian)
+        return hessian
+
+    def transfer(tensor, *args, **kwargs):
+        if not any(tensor is buffer for buffer in buffers):
+            return tensor_to(tensor, *args, **kwargs)
+        stage = "onload" if not transfers else "offload"
+        transfers.append(stage)
+        assert cache.hessian["mapping"] is tensor
+        if failure == stage:
+            raise error
+        # Distinct CPU buffers model transfer ownership without requiring CUDA.
+        copied = tensor.clone()
+        buffers.append(copied)
+        return copied
+
+    def accumulate_with_failure(inputs, layer, hessian):
+        assert cache.hessian["mapping"] is hessian
+        if failure == "before_accumulation":
+            raise error
+        result = accumulate(inputs, layer, hessian)
+        if failure == "after_accumulation":
+            raise error
+        return result
+
+    monkeypatch.setattr(calibration_cache, "make_empty_hessian", allocate_hessian)
+    monkeypatch.setattr(
+        calibration_cache, "accumulate_hessian", accumulate_with_failure
+    )
+    monkeypatch.setattr(torch.Tensor, "to", transfer)
+    hook = cache.make_capture_hook("mapping", capture_hessian=True)
+    with pytest.raises(RuntimeError) as raised:
+        hook(layer, (inputs,))
+    assert raised.value is error
+    assert cache.token_count["mapping"] == 3
+    assert "mapping" not in cache.cached_activations
+    if failure == "allocation":
+        assert "mapping" not in cache.hessian
+    else:
+        assert cache.hessian["mapping"] is buffers[-1]
+        expected = (
+            inputs.T @ inputs
+            if failure in ("after_accumulation", "offload")
+            else torch.zeros(16, 16)
+        )
+        assert _tensor_bytes(cache.hessian["mapping"]) == _tensor_bytes(expected)

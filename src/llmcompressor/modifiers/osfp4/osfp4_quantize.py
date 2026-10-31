@@ -46,18 +46,20 @@ def quantize_mapping(
     cache.wait(mapping.mapping_name, weight.device)
     alpha_dtype = torch.bfloat16 if mapping.requires_runtime_smoothing else weight_dtype
     observer = layers[0].weight_observer
-    input_batches = None if weight_only else cache.inputs[mapping.mapping_name]
+    input_batches = (
+        None if weight_only else cache.cached_activations[mapping.mapping_name]
+    )
     optimizer_batches = (
         input_batches
         if optimization_input_batches is None
         else optimization_input_batches
     )
-    sample_count = cache.sample_count[mapping.mapping_name]
+    token_count = cache.token_count[mapping.mapping_name]
     if mode == "sic":
         result = optimize_sic(
             weight,
             optimizer_batches,
-            cache.hessian[mapping.mapping_name].to(weight.device) / sample_count,
+            cache.hessian[mapping.mapping_name].to(weight.device) / token_count,
             observer=observer,
             alpha_dtype=alpha_dtype,
             weight_dtype=weight_dtype,
@@ -65,7 +67,7 @@ def quantize_mapping(
         )
     else:
         sigma_x_squared = (
-            cache.sigma_x_squared[mapping.mapping_name].to(weight.device) / sample_count
+            cache.sigma_x_squared[mapping.mapping_name].to(weight.device) / token_count
         )
         result = optimize_rtn(
             weight,
