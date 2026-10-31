@@ -33,13 +33,13 @@ from torch.utils.hooks import RemovableHandle
 from llmcompressor.core import Event, EventType, active_session
 from llmcompressor.modifiers.quantization.calibration import (
     apply_calibration_status,
-    calibrate_input_hook,
     calibrate_key_hook,
     calibrate_output_hook,
     calibrate_query_hook,
     calibrate_value_hook,
     freeze_module_quantization,
     initialize_observer,
+    observe_input_activations_hook,
     reset_quantization_status,
 )
 from llmcompressor.modifiers.quantization.group_size_validation import (
@@ -543,7 +543,9 @@ class QuantizationMixin(HooksMixin):
         if input:
             if not is_attention:
                 hooks.add(
-                    self.register_hook(module, calibrate_input_hook, "forward_pre")
+                    self.register_hook(
+                        module, observe_input_activations_hook, "forward_pre"
+                    )
                 )
             else:
                 if hasattr(module, IMPL_ATTR):

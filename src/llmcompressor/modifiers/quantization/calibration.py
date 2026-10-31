@@ -22,7 +22,7 @@ __all__ = [
     "initialize_observer",
     "observe",
     "update_qparams",
-    "calibrate_input_hook",
+    "observe_input_activations_hook",
     "calibrate_output_hook",
     "freeze_module_quantization",
     "apply_calibration_status",
@@ -181,10 +181,8 @@ def update_qparams(
                 getattr(module, full_param_name).data = param_val
 
 
-def calibrate_input_hook(module: Module, args: Any):
-    """
-    Hook to calibrate input activations by accumulating statistics in the observer.
-    """
+def observe_input_activations_hook(module: Module, args: Any):
+    """Accumulate input activation statistics in the layer's observer."""
     args = args[0] if isinstance(args, tuple) else args
     module.input_observer(args)
 

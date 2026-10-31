@@ -92,7 +92,7 @@ class OSFP4CalibrationCache:
                 "expected tokens and activation sample size must be positive"
             )
 
-        def capture_calibration_batch(layer: Linear, args: tuple[torch.Tensor, ...]) -> None:
+        def capture_calibration_batch_hook(layer: Linear, args: tuple[torch.Tensor, ...]) -> None:
             """Count tokens and capture calibration data from one input batch.
 
             Accumulate statistics from all rows and cache selected activations
@@ -155,7 +155,7 @@ class OSFP4CalibrationCache:
                     cached_batch
                 )
 
-        return capture_calibration_batch
+        return capture_calibration_batch_hook
 
     def _get_batch_sampled_indices(
         self,
