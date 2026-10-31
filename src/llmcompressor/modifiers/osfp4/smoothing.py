@@ -9,12 +9,15 @@ import torch
 from compressed_tensors.offload import update_offload_parameter
 from torch.nn import Linear, Module
 
+from llmcompressor.modifiers.quantization.calibration import update_qparams
+
+from .calibration_cache import OSFP4CalibrationCache
 from .transforms import TRANSFORM_MODULE
 
 if TYPE_CHECKING:
     from .base import OSFP4Mapping
 
-__all__ = ["deploy_mapping_smooth_quant_scale"]
+__all__ = ["deploy_mapping_smooth_quant_scale", "update_smoothed_input_global_scale"]
 
 
 def deploy_mapping_smooth_quant_scale(
@@ -70,3 +73,34 @@ def _deploy_runtime_smoothing(layer: Linear, scale: torch.Tensor) -> torch.Tenso
     update_offload_parameter(layer, "weight", weight)
 
     return transform.weight.detach().float()
+
+
+def update_smoothed_input_global_scale(
+    mapping: OSFP4Mapping,
+    cache: OSFP4CalibrationCache,
+    scale: torch.Tensor,
+) -> None:
+    """Update input global scales from smoothed calibration statistics."""
+    # Replay reads pinned CPU buffers on the host; finish their D2H copies.
+    cache.wait(mapping.mapping_name, torch.device("cpu"))
+    replay_inputs = cache.inputs[mapping.mapping_name]
+    if mapping.mapping_name in cache.input_absmax:
+        # Recalibrate from one row of per-channel maxima collected over all tokens.
+        maximum = cache.input_absmax[mapping.mapping_name].cpu()
+        replay_inputs = (maximum.unsqueeze(0),)
+
+    layers = mapping.balance_layers
+    observers = [layer.input_observer for layer in layers]
+    scale = scale.detach().float().reshape(1, -1)
+    # Discard pre-SmoothQuant statistics before replaying smoothed inputs.
+    for observer in observers:
+        for statistic in ("min_vals", "max_vals"):
+            if hasattr(observer, statistic):
+                delattr(observer, statistic)
+
+    for inputs in replay_inputs:
+        smoothed_inputs = inputs.detach().float() * scale.to(device=inputs.device)
+        for observer in observers:
+            observer(smoothed_inputs)
+
+    update_qparams(layers, "input")

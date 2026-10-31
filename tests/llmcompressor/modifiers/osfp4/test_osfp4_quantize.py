@@ -9,22 +9,22 @@ import torch
 from compressed_tensors.offload import OffloadCache, offload_module
 
 from llmcompressor.core import Event, State
-from llmcompressor.modifiers.osfp4 import OSFP4Modifier
+from llmcompressor.modifiers.osfp4 import OSFP4Modifier, smoothing
 from llmcompressor.modifiers.osfp4.base import OSFP4Mapping
 from llmcompressor.modifiers.osfp4.calibration_cache import OSFP4CalibrationCache
 from llmcompressor.modifiers.osfp4.optimization import (
     RTNQuantizationResult,
     SICQuantizationResult,
 )
-from llmcompressor.modifiers.osfp4.osfp4_quantize import optimize_mapping
+from llmcompressor.modifiers.osfp4.osfp4_quantize import quantize_mapping
 from llmcompressor.modifiers.osfp4.transforms import initialize_diagonal_smoothing
 
 from ._quantize_phases import run_phases
 from ._testing import LlamaForCausalLM, run_modifier
 
 
-def test_optimize_mapping_signature_has_no_optimizer_or_batch_controls():
-    parameters = inspect.signature(optimize_mapping).parameters
+def test_quantize_mapping_signature_has_no_optimizer_or_batch_controls():
+    parameters = inspect.signature(quantize_mapping).parameters
 
     assert "steps" not in parameters
     assert "lr" not in parameters
@@ -233,8 +233,8 @@ def test_mapping_phases_return_fused_row_slices(monkeypatch, mode):
         lambda _mapping, scale: scale,
     )
     monkeypatch.setattr(
-        osfp4_quantize,
-        "_update_smoothed_input_global_scale",
+        smoothing,
+        "update_smoothed_input_global_scale",
         lambda *_args: None,
     )
     cache = OSFP4CalibrationCache(
@@ -291,8 +291,6 @@ class RecordingInputObserver(torch.nn.Module):
     "missing_statistics", [(), ("min_vals",), ("max_vals",), ("min_vals", "max_vals")]
 )
 def test_smoothed_input_replay_updates_every_target(monkeypatch, missing_statistics):
-    from llmcompressor.modifiers.osfp4 import osfp4_quantize
-
     layers = (torch.nn.Linear(4, 3), torch.nn.Linear(4, 2))
     observers = (RecordingInputObserver(), RecordingInputObserver())
     for layer, observer in zip(layers, observers):
@@ -306,7 +304,7 @@ def test_smoothed_input_replay_updates_every_target(monkeypatch, missing_statist
     scale = torch.tensor([0.5, 1.0, 1.5, 2.0])
     updates = []
     monkeypatch.setattr(
-        osfp4_quantize,
+        smoothing,
         "update_qparams",
         lambda modules, base_name: updates.append((modules, base_name)),
     )
@@ -318,7 +316,9 @@ def test_smoothed_input_replay_updates_every_target(monkeypatch, missing_statist
         )
         for index, observer in enumerate(observers)
     ]
-    osfp4_quantize._update_smoothed_input_global_scale(layers, batches, scale)
+    mapping = OSFP4Mapping("mapping", None, layers)
+    cache = OSFP4CalibrationCache(inputs={"mapping": list(batches)})
+    smoothing.update_smoothed_input_global_scale(mapping, cache, scale)
     for handle in handles:
         handle.remove()
 
@@ -328,6 +328,44 @@ def test_smoothed_input_replay_updates_every_target(monkeypatch, missing_statist
         for observed, batch in zip(observer.observed, batches):
             assert torch.equal(observed, batch * scale)
     assert updates == [(layers, "input")]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("case", ["mixed", "zeros", "small"])
+def test_extrema_recalibration_matches_full_and_two_row_global_scale(dtype, case):
+    _, layer = _prepared_layer("rtn", dtype)
+    mapping = OSFP4Mapping("mapping", None, (layer,))
+    rows = torch.arange(64, dtype=torch.float32).reshape(4, 16) - 32
+    rows[0].zero_()
+    rows[-1].mul_(-4)
+    if case == "zeros":
+        rows.zero_()
+    elif case == "small":
+        rows.mul_(1e-6)
+    rows = rows.to(dtype)
+    scale = torch.linspace(0.125, 8, 16).to(torch.bfloat16).float()
+    maximum = rows.float().abs().amax(0)
+
+    cache = OSFP4CalibrationCache(inputs={"mapping": list(rows.split(2))})
+    smoothing.update_smoothed_input_global_scale(mapping, cache, scale)
+    full_scale = layer.input_global_scale.clone()
+    cache = OSFP4CalibrationCache(
+        inputs={"mapping": [torch.stack((-maximum, maximum))]}
+    )
+    smoothing.update_smoothed_input_global_scale(mapping, cache, scale)
+    two_row_scale = layer.input_global_scale.clone()
+
+    # The retained sample misses the extrema; recalibration must use all-token maxima.
+    cache = OSFP4CalibrationCache(
+        inputs={"mapping": [rows[:1]]},
+        input_absmax={"mapping": maximum},
+    )
+    smoothing.update_smoothed_input_global_scale(mapping, cache, scale)
+    actual = layer.input_global_scale
+    for expected in (full_scale, two_row_scale):
+        assert actual.shape == expected.shape
+        assert actual.dtype == expected.dtype
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
 def test_invalid_optimized_scales_fail_before_weight_smoothing(monkeypatch):

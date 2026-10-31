@@ -55,9 +55,9 @@ def test_partial_deployment_requires_fresh_model_and_modifier(
             )
         elif stage == "replay":
             patch.setattr(
-                osfp4_quantize,
-                "_update_smoothed_input_global_scale",
-                after_write(osfp4_quantize._update_smoothed_input_global_scale),
+                base,
+                "update_smoothed_input_global_scale",
+                after_write(base.update_smoothed_input_global_scale),
             )
         elif stage == "preparation":
             patch.setattr(

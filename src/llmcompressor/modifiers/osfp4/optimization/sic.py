@@ -87,10 +87,7 @@ def optimize_sic(
 
     L = n // _QUANTIZATION_GROUP_SIZE
     W_blocks = W.reshape(m, L, _QUANTIZATION_GROUP_SIZE).permute(1, 0, 2).contiguous()
-    u_diag_squared_blocks = U_diag.square().reshape(
-        L,
-        _QUANTIZATION_GROUP_SIZE,
-    )
+    u_diag_squared_blocks = U_diag.square().reshape(L, _QUANTIZATION_GROUP_SIZE)
     X_blocks = None
     if cached_activation_batches is not None:
         X_blocks = assemble_activation_quantization_groups(
@@ -110,8 +107,8 @@ def optimize_sic(
 
     Y = U @ W.transpose(0, 1)
     W_hat = torch.zeros_like(W)
-    for l in range(L - 1, -1, -1):
-        block_start = l * _QUANTIZATION_GROUP_SIZE
+    for block_idx in range(L - 1, -1, -1):
+        block_start = block_idx * _QUANTIZATION_GROUP_SIZE
         block_end = block_start + _QUANTIZATION_GROUP_SIZE
 
         U_block = U[block_start:block_end, block_start:block_end]
@@ -124,18 +121,18 @@ def optimize_sic(
             (Y_block_approx / U_block_diag[:, None]).transpose(0, 1).unsqueeze(0)
         )
         block_optimized = OptimizedQuantizationGroupScales(
-            optimized.alpha[l : l + 1],
-            optimized.gamma_w[l : l + 1],
+            optimized.alpha[block_idx : block_idx + 1],
+            optimized.gamma_w[block_idx : block_idx + 1],
         )
         scales, zero_points = observer.select_weight_qparams(
             W_block_target,
             block_optimized,
-            weight_metric=u_diag_squared_blocks[l : l + 1],
+            weight_metric=u_diag_squared_blocks[block_idx : block_idx + 1],
         )
         gamma_w_final_l = scales.view(-1)
-        gamma_w_final[:, l] = gamma_w_final_l
-        weight_zero_point[:, l] = zero_points.view(-1)
-        alpha_l = optimized.alpha[l]
+        gamma_w_final[:, block_idx] = gamma_w_final_l
+        weight_zero_point[:, block_idx] = zero_points.view(-1)
+        alpha_l = optimized.alpha[block_idx]
 
         for t in range(block_end - 1, block_start - 1, -1):
             alpha_r = alpha_l[t - block_start]

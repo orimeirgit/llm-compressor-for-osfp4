@@ -41,12 +41,11 @@ from llmcompressor.utils.pytorch.module import get_module_to_name_dict
 from .activation_subsampling import subsample_activations
 from .calibration_cache import OSFP4CalibrationCache
 from .optimization import RTNQuantizationResult, SICQuantizationResult
-from .osfp4_quantize import (
-    optimize_mapping,
-    prepare_mapping_parameters,
-    recalibrate_mapping_inputs,
+from .osfp4_quantize import quantize_mapping
+from .smoothing import (
+    deploy_mapping_smooth_quant_scale,
+    update_smoothed_input_global_scale,
 )
-from .smoothing import deploy_mapping_smooth_quant_scale
 from .transforms import initialize_diagonal_smoothing
 
 __all__ = ["OSFP4Mapping", "OSFP4Modifier"]
@@ -65,6 +64,35 @@ class OSFP4Mapping:
     @property
     def requires_runtime_smoothing(self) -> bool:
         return self.smooth_layer is None
+
+
+def prepare_mapping_parameters(
+    mapping: OSFP4Mapping,
+    result: RTNQuantizationResult | SICQuantizationResult,
+) -> list[tuple[Module, dict[str, torch.Tensor]]]:
+    """Split optimized weight parameters into per-layer installation order."""
+    layers = mapping.balance_layers
+    quantized_weight = (
+        result.quantized_weight if isinstance(result, SICQuantizationResult) else None
+    )
+    deployment: list[tuple[Module, dict[str, torch.Tensor]]] = []
+    row_start = 0
+    for layer in layers:
+        row_end = row_start + layer.weight.shape[0]
+        qparams: dict[str, torch.Tensor] = {}
+        if quantized_weight is not None:
+            qparams["weight"] = quantized_weight[row_start:row_end].to(layer.weight)
+        qparams["weight_scale"] = result.gamma_w_final[row_start:row_end].to(
+            layer.weight_scale
+        )
+        qparams["weight_zero_point"] = result.weight_zero_point[row_start:row_end].to(
+            layer.weight_zero_point
+        )
+        # Selected block scales carry the scaling; the global multiplier is one.
+        qparams["weight_global_scale"] = torch.ones_like(layer.weight_global_scale)
+        deployment.append((layer, qparams))
+        row_start = row_end
+    return deployment
 
 
 class OSFP4Modifier(Modifier, QuantizationMixin):
@@ -422,7 +450,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         if mapping.mapping_name in self._optimized_mapping_names:
             return
         optimization_input_batches = self._sample_optimization_inputs(mapping)
-        result = optimize_mapping(
+        result = quantize_mapping(
             mapping,
             self._calibration,
             mode=self.optimization_mode,
@@ -485,7 +513,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         try:
             scale = deploy_mapping_smooth_quant_scale(mapping, result.alpha)
             if not self._weight_only:
-                recalibrate_mapping_inputs(mapping, self._calibration, scale)
+                update_smoothed_input_global_scale(mapping, self._calibration, scale)
             deployment = prepare_mapping_parameters(mapping, result)
             for layer, qparams in deployment:
                 for name, value in qparams.items():

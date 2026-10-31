@@ -3,7 +3,7 @@
 
 """Compose production phases for mapping-level tests."""
 
-from llmcompressor.modifiers.osfp4 import osfp4_quantize, smoothing
+from llmcompressor.modifiers.osfp4 import base, osfp4_quantize, smoothing
 
 
 def run_phases(
@@ -15,7 +15,7 @@ def run_phases(
     weight_only,
     optimization_input_batches=None,
 ):
-    result = osfp4_quantize.optimize_mapping(
+    result = osfp4_quantize.quantize_mapping(
         mapping,
         cache,
         mode=mode,
@@ -25,5 +25,5 @@ def run_phases(
     )
     scale = smoothing.deploy_mapping_smooth_quant_scale(mapping, result.alpha)
     if not weight_only:
-        osfp4_quantize.recalibrate_mapping_inputs(mapping, cache, scale)
-    return osfp4_quantize.prepare_mapping_parameters(mapping, result)
+        smoothing.update_smoothed_input_global_scale(mapping, cache, scale)
+    return base.prepare_mapping_parameters(mapping, result)
