@@ -20,7 +20,18 @@ __all__ = ["OSFP4CalibrationCache"]
 
 @dataclass
 class OSFP4CalibrationCache:
-    """Own mapping inputs, raw statistic sums, token counts, and capture state."""
+    """Store calibration data and capture state for each OSFP4 mapping.
+
+    Flow: receive batch activations -> identify sampled token rows for optimization
+    -> accumulate statistics -> prepare activations -> optimize in the modifier
+    -> clear the mapping's cached data.
+
+    Each batch contributes statistics from all tokens, while retained activation
+    rows are cached to evaluate quantization reconstruction loss during
+    optimization. Preparation waits for capture to finish and combines sampled
+    batches for optimization. Weight-only calibration stores statistics without
+    caching activations.
+    """
 
     offload_hessians: bool = False
 
