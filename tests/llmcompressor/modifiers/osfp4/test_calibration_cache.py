@@ -23,18 +23,14 @@ def _tensor_bytes(tensor):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("noncontiguous", [False, True])
-@pytest.mark.parametrize("cache_inputs", [False, True])
-@pytest.mark.parametrize(
-    "capture_hessian,capture_sigma_x_squared",
-    [(False, False), (True, False), (False, True), (True, True)],
-)
+@pytest.mark.parametrize("cache_activations", [False, True])
+@pytest.mark.parametrize("optimization_mode", ["rtn", "sic"])
 @pytest.mark.parametrize("offload_hessians", [False, True])
 def test_capture_preserves_exact_statistics_and_input_bytes(
     dtype,
     noncontiguous,
-    cache_inputs,
-    capture_hessian,
-    capture_sigma_x_squared,
+    cache_activations,
+    optimization_mode,
     offload_hessians,
 ):
     generator = torch.Generator().manual_seed(23)
@@ -53,9 +49,8 @@ def test_capture_preserves_exact_statistics_and_input_bytes(
 
     hook = cache.make_capture_hook(
         "mapping",
-        capture_hessian=capture_hessian,
-        cache_inputs=cache_inputs,
-        capture_sigma_x_squared=capture_sigma_x_squared,
+        optimization_mode=optimization_mode,
+        cache_activations=cache_activations,
     )
     expected_hessian = torch.zeros(16, 16)
     expected_sigma = torch.zeros(16)
@@ -69,20 +64,20 @@ def test_capture_preserves_exact_statistics_and_input_bytes(
 
     assert cache.token_count["mapping"] == 15
     assert "mapping" not in cache.capture_events
-    if capture_hessian:
+    if optimization_mode == "sic":
         assert _tensor_bytes(cache.hessian["mapping"]) == _tensor_bytes(
             expected_hessian
         )
         assert cache.hessian["mapping"].device.type == "cpu"
     else:
         assert "mapping" not in cache.hessian
-    if capture_sigma_x_squared:
-        assert _tensor_bytes(cache.sigma_x_squared["mapping"]) == _tensor_bytes(
+    if optimization_mode == "rtn":
+        assert _tensor_bytes(cache.sigma_x_squared_sum["mapping"]) == _tensor_bytes(
             expected_sigma
         )
     else:
-        assert "mapping" not in cache.sigma_x_squared
-    if cache_inputs:
+        assert "mapping" not in cache.sigma_x_squared_sum
+    if cache_activations:
         for cached, expected, source in zip(
             cache.cached_activations["mapping"], expected_inputs, batches
         ):
@@ -98,34 +93,41 @@ def test_capture_preserves_exact_statistics_and_input_bytes(
         assert "mapping" not in cache.cached_activations
 
 
-@pytest.mark.parametrize("cache_inputs", [False, True])
-def test_empty_capture_preserves_readiness_semantics(cache_inputs):
+@pytest.mark.parametrize("cache_activations", [False, True])
+@pytest.mark.parametrize("optimization_mode", ["rtn", "sic"])
+def test_empty_capture_preserves_readiness_semantics(
+    cache_activations, optimization_mode
+):
     cache = OSFP4CalibrationCache()
     layer = torch.nn.Linear(16, 4, bias=False)
     batch = torch.empty(0, 3, 16)
 
     cache.make_capture_hook(
         "mapping",
-        capture_hessian=True,
-        cache_inputs=cache_inputs,
-        capture_sigma_x_squared=True,
+        optimization_mode=optimization_mode,
+        cache_activations=cache_activations,
     )(layer, (batch,))
 
     assert cache.token_count["mapping"] == 0
-    assert _tensor_bytes(cache.hessian["mapping"]) == _tensor_bytes(torch.zeros(16, 16))
-    assert _tensor_bytes(cache.sigma_x_squared["mapping"]) == _tensor_bytes(
-        torch.zeros(16)
-    )
-    assert cache.has_observation("mapping") is cache_inputs
+    if optimization_mode == "sic":
+        assert _tensor_bytes(cache.hessian["mapping"]) == _tensor_bytes(
+            torch.zeros(16, 16)
+        )
+        assert not cache.sigma_x_squared_sum
+    else:
+        assert _tensor_bytes(cache.sigma_x_squared_sum["mapping"]) == _tensor_bytes(
+            torch.zeros(16)
+        )
+        assert not cache.hessian
+    assert cache.has_calibration_data("mapping") is cache_activations
     assert "mapping" not in cache.capture_events
 
 
-def test_cleanup_preserves_other_mappings_and_clears_streams():
+@pytest.mark.parametrize("optimization_mode", ["rtn", "sic"])
+def test_cleanup_preserves_other_mappings_and_clears_streams(optimization_mode):
     cache = OSFP4CalibrationCache()
     layer = torch.nn.Linear(16, 4, bias=False)
-    hook = cache.make_capture_hook(
-        "first", capture_hessian=True, capture_sigma_x_squared=True
-    )
+    hook = cache.make_capture_hook("first", optimization_mode=optimization_mode)
     hook(layer, (torch.randn(2, 16),))
     cache.cached_activations["second"] = [torch.ones(1, 16)]
     cache.capture_events["second"] = {}
@@ -138,7 +140,7 @@ def test_cleanup_preserves_other_mappings_and_clears_streams():
     assert set(cache.capture_events) == {"second"}
     assert set(cache.token_count) == {"second"}
     assert not cache.hessian
-    assert not cache.sigma_x_squared
+    assert not cache.sigma_x_squared_sum
     assert cache.capture_streams
 
     cache.clear_all()
@@ -148,7 +150,7 @@ def test_cleanup_preserves_other_mappings_and_clears_streams():
             cache.cached_activations,
             cache.capture_events,
             cache.hessian,
-            cache.sigma_x_squared,
+            cache.sigma_x_squared_sum,
             cache.token_count,
             cache.capture_streams,
         )
@@ -181,14 +183,14 @@ def test_wait_uses_consumer_stream_or_host_synchronization(monkeypatch):
         torch.get_device_module("cuda"), "current_stream", lambda device: Stream()
     )
 
-    cache.wait("mapping", torch.device("cuda"))
+    cache.wait_for_capture("mapping", torch.device("cuda"))
     assert calls == [("wait_event", "first"), ("wait_event", "second")]
 
     calls.clear()
-    cache.wait("mapping", torch.device("cpu"))
+    cache.wait_for_capture("mapping", torch.device("cpu"))
     assert calls == [("synchronize", "first"), ("synchronize", "second")]
     calls.clear()
-    cache.wait("missing", torch.device("cpu"))
+    cache.wait_for_capture("missing", torch.device("cpu"))
     assert calls == []
 
 
@@ -218,7 +220,7 @@ def test_calibration_cache_accumulates_raw_osfp4_hessian():
         torch.randn(2, 3, 16, generator=generator),
         torch.randn(1, 5, 16, generator=generator),
     ]
-    hook = cache.make_capture_hook("mapping", capture_hessian=True)
+    hook = cache.make_capture_hook("mapping", optimization_mode="sic")
     for batch in batches:
         hook(module, (batch,))
 
@@ -237,7 +239,7 @@ def test_calibration_cache_accumulates_raw_osfp4_hessian():
 def test_calibration_cache_clears_hessian_state():
     cache = OSFP4CalibrationCache(offload_hessians=True)
     module = torch.nn.Linear(16, 4, bias=False)
-    cache.make_capture_hook("mapping", capture_hessian=True)(
+    cache.make_capture_hook("mapping", optimization_mode="sic")(
         module, (torch.randn(2, 3, 16),)
     )
 
@@ -251,7 +253,7 @@ def test_calibration_cache_clears_hessian_state():
 def test_calibration_cache_does_not_duplicate_activation_statistics():
     cache = OSFP4CalibrationCache()
     module = torch.nn.Linear(16, 4, bias=False)
-    cache.make_capture_hook("mapping", capture_hessian=False)(
+    cache.make_capture_hook("mapping", optimization_mode="rtn")(
         module, (torch.randn(2, 3, 16),)
     )
 
@@ -269,20 +271,19 @@ def test_weight_only_rtn_streams_sigma_x_squared_without_raw_inputs():
     ]
     hook = cache.make_capture_hook(
         "mapping",
-        capture_hessian=False,
-        cache_inputs=False,
-        capture_sigma_x_squared=True,
+        optimization_mode="rtn",
+        cache_activations=False,
     )
     for batch in batches:
         hook(module, (batch,))
 
     concatenated = torch.cat([batch.reshape(-1, 16) for batch in batches])
     torch.testing.assert_close(
-        cache.sigma_x_squared["mapping"],
+        cache.sigma_x_squared_sum["mapping"],
         concatenated.square().sum(dim=0),
     )
     assert cache.token_count["mapping"] == concatenated.shape[0]
-    assert cache.has_observation("mapping")
+    assert cache.has_calibration_data("mapping")
     assert "mapping" not in cache.cached_activations
     assert "mapping" not in cache.hessian
 
@@ -297,16 +298,15 @@ def test_nvfp4_rtn_streams_sigma_x_squared_with_raw_inputs():
     ]
     hook = cache.make_capture_hook(
         "mapping",
-        capture_hessian=False,
-        cache_inputs=True,
-        capture_sigma_x_squared=True,
+        optimization_mode="rtn",
+        cache_activations=True,
     )
     for batch in batches:
         hook(module, (batch,))
 
     concatenated = torch.cat([batch.reshape(-1, 16) for batch in batches])
     torch.testing.assert_close(
-        cache.sigma_x_squared["mapping"],
+        cache.sigma_x_squared_sum["mapping"],
         concatenated.square().sum(dim=0),
     )
     assert len(cache.cached_activations["mapping"]) == len(batches)
@@ -320,12 +320,12 @@ def test_weight_only_sic_streams_hessian_without_raw_inputs():
     batch = torch.randn(2, 3, 16)
     cache.make_capture_hook(
         "mapping",
-        capture_hessian=True,
-        cache_inputs=False,
+        optimization_mode="sic",
+        cache_activations=False,
     )(module, (batch,))
 
     assert "mapping" not in cache.cached_activations
-    assert "mapping" not in cache.sigma_x_squared
+    assert "mapping" not in cache.sigma_x_squared_sum
     assert cache.token_count["mapping"] == 6
     torch.testing.assert_close(
         cache.hessian["mapping"],
@@ -335,7 +335,9 @@ def test_weight_only_sic_streams_hessian_without_raw_inputs():
 
 @pytest.mark.parametrize("retain_all", [False, True])
 @pytest.mark.parametrize("single_batch", [False, True])
-def test_prepare_sampled_activations_waits_for_pending_cpu_buffers(retain_all, single_batch):
+def test_prepare_sampled_activations_waits_for_pending_cpu_buffers(
+    retain_all, single_batch
+):
     indices = torch.arange(5) if retain_all else torch.tensor([1, 3])
     expected = torch.arange(indices.numel() * 16, dtype=torch.float32).reshape(-1, 16)
     source_batches = (expected,) if single_batch else expected.split(1)
@@ -482,7 +484,7 @@ def test_hessian_capture_failure_preserves_partial_cache(monkeypatch, offload, f
         calibration_cache, "accumulate_hessian", accumulate_with_failure
     )
     monkeypatch.setattr(torch.Tensor, "to", transfer)
-    hook = cache.make_capture_hook("mapping", capture_hessian=True)
+    hook = cache.make_capture_hook("mapping", optimization_mode="sic")
     with pytest.raises(RuntimeError) as raised:
         hook(layer, (inputs,))
     assert raised.value is error

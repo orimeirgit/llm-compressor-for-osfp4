@@ -52,10 +52,10 @@ def quantize_mapping(
     mapping: OSFP4Mapping,
     cache: OSFP4CalibrationCache,
     *,
-    mode: Literal["rtn", "sic"],
+    optimization_mode: Literal["rtn", "sic"],
     dampening_frac: float,
     weight_only: bool,
-    optimization_input_batches: tuple[torch.Tensor, ...] | None = None,
+    sampled_activations: tuple[torch.Tensor, ...] | None = None,
     _deployment_stage: Callable[[str], None] | None = None,
 ) -> list[tuple[Module, dict[str, torch.Tensor]]]:
     """Normalize cached statistics, optimize one mapping, and return deployment."""
@@ -69,19 +69,17 @@ def quantize_mapping(
         ],
         dim=0,
     )
-    cache.wait(mapping.mapping_name, weight.device)
+    cache.wait_for_capture(mapping.mapping_name, weight.device)
     alpha_dtype = torch.bfloat16 if mapping.requires_runtime_smoothing else weight_dtype
     observer = layers[0].weight_observer
     input_batches = (
         None if weight_only else cache.cached_activations[mapping.mapping_name]
     )
     optimizer_batches = (
-        input_batches
-        if optimization_input_batches is None
-        else optimization_input_batches
+        input_batches if sampled_activations is None else sampled_activations
     )
     token_count = cache.token_count[mapping.mapping_name]
-    if mode == "sic":
+    if optimization_mode == "sic":
         result = optimize_sic(
             weight,
             optimizer_batches,
@@ -94,7 +92,7 @@ def quantize_mapping(
         quantized_weight = result.quantized_weight
     else:
         sigma_x_squared = (
-            cache.sigma_x_squared[mapping.mapping_name].to(weight.device) / token_count
+            cache.sigma_x_squared_sum[mapping.mapping_name].to(weight.device) / token_count
         )
         result = optimize_rtn(
             weight,
@@ -113,7 +111,7 @@ def quantize_mapping(
         if _deployment_stage is not None:
             _deployment_stage("input-scale replay")
         # Replay reads pinned CPU buffers on the host; finish their D2H copies.
-        cache.wait(mapping.mapping_name, torch.device("cpu"))
+        cache.wait_for_capture(mapping.mapping_name, torch.device("cpu"))
         replay_inputs = cache.cached_activations[mapping.mapping_name]
         if mapping.mapping_name in cache.input_channel_absmax:
             # max(abs(s * x)) = max(abs(s) * max_tokens(abs(x))). Replay

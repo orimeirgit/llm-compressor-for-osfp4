@@ -64,12 +64,14 @@ def snapshot(model):
     }
 
 
-@pytest.mark.parametrize("mode", ["rtn", "sic"])
+@pytest.mark.parametrize("optimization_mode", ["rtn", "sic"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("layout", ["runtime", "folded", "shared"])
 @pytest.mark.parametrize("policy", ["full", "sampled", "extrema", "weight_only"])
 @pytest.mark.parametrize("offloaded", [False, True])
-def test_mapping_phases_match_reference_bytes(mode, dtype, layout, policy, offloaded):
+def test_mapping_phases_match_reference_bytes(
+    optimization_mode, dtype, layout, policy, offloaded
+):
     def execute(implementation):
         torch.manual_seed(37)
         model = torch.nn.Module()
@@ -83,7 +85,7 @@ def test_mapping_phases_match_reference_bytes(mode, dtype, layout, policy, offlo
         modifier = OSFP4Modifier(
             scheme="NVFP4A16" if policy == "weight_only" else "NVFP4",
             targets=["Linear"],
-            optimization_mode=mode,
+            optimization_mode=optimization_mode,
             steps=2,
         )
         modifier.initialize_quantization(model)
@@ -109,14 +111,16 @@ def test_mapping_phases_match_reference_bytes(mode, dtype, layout, policy, offlo
             if policy == "weight_only"
             else {"mapping": list(sampled) if policy == "extrema" else batches},
             hessian={"mapping": rows.float().T @ rows.float()},
-            sigma_x_squared={"mapping": rows.float().square().sum(0)},
+            sigma_x_squared_sum={"mapping": rows.float().square().sum(0)},
             token_count={"mapping": rows.shape[0]},
             input_channel_absmax={"mapping": rows.float().abs().amax(0)}
             if policy == "extrema"
             else {},
         )
         captured = []
-        optimizer_name = "optimize_sic" if mode == "sic" else "optimize_rtn"
+        optimizer_name = (
+            "optimize_sic" if optimization_mode == "sic" else "optimize_rtn"
+        )
         optimizer = getattr(
             reference
             if implementation is reference.quantize_mapping
@@ -142,10 +146,10 @@ def test_mapping_phases_match_reference_bytes(mode, dtype, layout, policy, offlo
             deployment = implementation(
                 mapping,
                 cache,
-                mode=mode,
+                optimization_mode=optimization_mode,
                 dampening_frac=0.01,
                 weight_only=policy == "weight_only",
-                optimization_input_batches=sampled,
+                sampled_activations=sampled,
             )
         before_install = snapshot(model)
         parameters = []
@@ -181,14 +185,14 @@ def reference_optimize_mapping(self, mapping):
     self._require_usable()
     if mapping.mapping_name in self._optimized_mapping_names:
         return
-    sampled = self._sample_optimization_inputs(mapping)
+    sampled = self._sample_optimization_activations(mapping)
     deployment = reference.quantize_mapping(
         mapping,
         self._calibration,
-        mode=self.optimization_mode,
+        optimization_mode=self.optimization_mode,
         dampening_frac=self.dampening_frac,
         weight_only=self._weight_only,
-        optimization_input_batches=sampled,
+        sampled_activations=sampled,
     )
     for layer, qparams in deployment:
         for name, value in qparams.items():
@@ -197,7 +201,7 @@ def reference_optimize_mapping(self, mapping):
     self._calibration.clear_mapping(mapping.mapping_name)
 
 
-@pytest.mark.parametrize("mode", ["rtn", "sic"])
+@pytest.mark.parametrize("optimization_mode", ["rtn", "sic"])
 @pytest.mark.parametrize(
     "scheme,policy",
     [
@@ -209,7 +213,7 @@ def reference_optimize_mapping(self, mapping):
 )
 @pytest.mark.parametrize("device", DEVICES)
 def test_sequential_export_matches_reference_bytes(
-    mode, scheme, policy, device, tmp_path
+    optimization_mode, scheme, policy, device, tmp_path
 ):
     def execute(legacy):
         torch.manual_seed(42)
@@ -232,7 +236,7 @@ def test_sequential_export_matches_reference_bytes(
         loader = torch.utils.data.DataLoader(samples, batch_size=None)
         modifier = OSFP4Modifier(
             scheme=scheme,
-            optimization_mode=mode,
+            optimization_mode=optimization_mode,
             ignore=["lm_head"],
             steps=2,
             activation_subsample_size="auto"

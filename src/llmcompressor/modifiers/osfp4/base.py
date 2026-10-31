@@ -350,19 +350,19 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         )
         try:
             with torch.random.fork_rng(devices=devices):
-                count = 0
+                total_num_tokens = 0
                 for batch in dataloader:
                     if not isinstance(batch, Mapping):
                         return None
                     inputs = batch.get("input_ids")
                     if isinstance(inputs, torch.Tensor):
-                        count += inputs.numel()
+                        total_num_tokens += inputs.numel()
                     else:
                         inputs = batch.get("inputs_embeds")
                         if not isinstance(inputs, torch.Tensor):
                             return None
-                        count += inputs.numel() // inputs.shape[-1]
-                return count or None
+                        total_num_tokens += inputs.numel() // inputs.shape[-1]
+                return total_num_tokens or None
         finally:
             random.setstate(python_rng)
             np.random.set_state(numpy_rng)
@@ -390,14 +390,16 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
                 "OSFP4 cannot count calibration token rows; "
                 "using full activation caching"
             )
-        subsample_sizes = [
+        activation_subsample_sizes = [
             self._resolve_activation_subsample_size(mapping)[0]
             for mapping in self._resolved_mappings
         ]
-        for mapping, subsample_size in zip(self._resolved_mappings, subsample_sizes):
-            streaming = (
+        for mapping, activation_subsample_size in zip(
+            self._resolved_mappings, activation_subsample_sizes
+        ):
+            subsample_during_capture = (
                 total_num_tokens is not None
-                and subsample_size is not None
+                and activation_subsample_size is not None
                 and not self._weight_only
                 and all(
                     type(getattr(layer, "input_observer", None)) is StaticMinMaxObserver
@@ -411,11 +413,12 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
                 mapping.balance_layers[0],
                 self._calibration.make_capture_hook(
                     mapping.mapping_name,
-                    capture_hessian=self.optimization_mode == "sic",
-                    cache_inputs=not self._weight_only,
-                    capture_sigma_x_squared=self.optimization_mode == "rtn",
-                    total_num_tokens=total_num_tokens if streaming else None,
-                    subsample_size=subsample_size,
+                    optimization_mode=self.optimization_mode,
+                    cache_activations=not self._weight_only,
+                    total_num_tokens=total_num_tokens
+                    if subsample_during_capture
+                    else None,
+                    activation_subsample_size=activation_subsample_size,
                 ),
                 "forward_pre",
             )
@@ -437,7 +440,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         available = [
             mapping
             for mapping in self._resolved_mappings
-            if self._calibration.has_observation(mapping.mapping_name)
+            if self._calibration.has_calibration_data(mapping.mapping_name)
             and mapping.mapping_name not in self._optimized_mapping_names
         ]
         for mapping in available:
@@ -449,24 +452,26 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         self._require_usable()
         if mapping.mapping_name in self._optimized_mapping_names:
             return
-        optimization_input_batches = self._sample_optimization_inputs(mapping)
+        sampled_activations = self._sample_optimization_activations(mapping)
         result = quantize_mapping(
             mapping,
             self._calibration,
-            mode=self.optimization_mode,
+            optimization_mode=self.optimization_mode,
             dampening_frac=self.dampening_frac,
             weight_only=self._weight_only,
-            optimization_input_batches=optimization_input_batches,
+            sampled_activations=sampled_activations,
         )
         self._deploy_mapping(mapping, result)
         self._optimized_mapping_names.add(mapping.mapping_name)
         self._calibration.clear_mapping(mapping.mapping_name)
 
-    def _sample_optimization_inputs(
+    def _sample_optimization_activations(
         self, mapping: OSFP4Mapping
     ) -> tuple[torch.Tensor, ...] | None:
-        subsample_size, input_width = self._resolve_activation_subsample_size(mapping)
-        if subsample_size is None:
+        activation_subsample_size, input_width = (
+            self._resolve_activation_subsample_size(mapping)
+        )
+        if activation_subsample_size is None:
             return None
 
         output_rows = sum(layer.weight.shape[0] for layer in mapping.balance_layers)
@@ -476,10 +481,10 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
             )
         else:
             # Finish D2H capture before sampling the cached CPU rows.
-            self._calibration.wait(mapping.mapping_name, torch.device("cpu"))
+            self._calibration.wait_for_capture(mapping.mapping_name, torch.device("cpu"))
             selection = subsample_activations(
                 self._calibration.cached_activations[mapping.mapping_name],
-                subsample_size,
+                activation_subsample_size,
                 output_rows=output_rows,
             )
         provenance = selection.provenance.copy()

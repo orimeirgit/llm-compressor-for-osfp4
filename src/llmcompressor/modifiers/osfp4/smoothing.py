@@ -82,15 +82,15 @@ def update_smoothed_input_global_scale(
 ) -> None:
     """Update input global scales from smoothed calibration statistics."""
     # Replay reads pinned CPU buffers on the host; finish their D2H copies.
-    cache.wait(mapping.mapping_name, torch.device("cpu"))
-    replay_inputs = cache.cached_activations[mapping.mapping_name]
+    cache.wait_for_capture(mapping.mapping_name, torch.device("cpu"))
+    calibration_activations = cache.cached_activations[mapping.mapping_name]
     if mapping.mapping_name in cache.input_channel_absmax:
         # Recalibrate from one row of per-channel maxima collected over all tokens.
-        maximum = cache.input_channel_absmax[mapping.mapping_name].cpu()
-        replay_inputs = (maximum.unsqueeze(0),)
+        input_channel_absmax = cache.input_channel_absmax[mapping.mapping_name].cpu()
+        calibration_activations = (input_channel_absmax.unsqueeze(0),)
 
-    layers = mapping.balance_layers
-    observers = [layer.input_observer for layer in layers]
+    balance_layers = mapping.balance_layers
+    observers = [layer.input_observer for layer in balance_layers]
     scale = scale.detach().float().reshape(1, -1)
 
     # Clear statistics collected before applying the smoothing scale.
@@ -99,9 +99,11 @@ def update_smoothed_input_global_scale(
             if hasattr(observer, statistic):
                 delattr(observer, statistic)
 
-    for inputs in replay_inputs:
-        smoothed_inputs = inputs.detach().float() * scale.to(device=inputs.device)
+    for activations in calibration_activations:
+        smoothed_activations = activations.detach().float() * scale.to(
+            device=activations.device
+        )
         for observer in observers:
-            observer(smoothed_inputs)
+            observer(smoothed_activations)
 
-    update_qparams(layers, "input")
+    update_qparams(balance_layers, "input")

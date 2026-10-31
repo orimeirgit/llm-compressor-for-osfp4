@@ -27,38 +27,36 @@ def quantize_mapping(
     mapping: OSFP4Mapping,
     cache: OSFP4CalibrationCache,
     *,
-    mode: Literal["rtn", "sic"],
+    optimization_mode: Literal["rtn", "sic"],
     dampening_frac: float,
     weight_only: bool,
-    optimization_input_batches: tuple[torch.Tensor, ...] | None = None,
+    sampled_activations: tuple[torch.Tensor, ...] | None = None,
 ) -> RTNQuantizationResult | SICQuantizationResult:
     """Optimize one mapping without installing weights or smoothing."""
-    layers = mapping.balance_layers
-    weight_dtype = layers[0].weight.dtype
-    device = layers[0].weight.device
+    balance_layers = mapping.balance_layers
+    weight_dtype = balance_layers[0].weight.dtype
+    device = balance_layers[0].weight.device
     weight = torch.cat(
         [
             layer.weight.detach().to(device=device, dtype=torch.float32)
-            for layer in layers
+            for layer in balance_layers
         ],
         dim=0,
     )
-    cache.wait(mapping.mapping_name, weight.device)
+    cache.wait_for_capture(mapping.mapping_name, weight.device)
     alpha_dtype = torch.bfloat16 if mapping.requires_runtime_smoothing else weight_dtype
-    observer = layers[0].weight_observer
-    input_batches = (
+    observer = balance_layers[0].weight_observer
+    cached_activations = (
         None if weight_only else cache.cached_activations[mapping.mapping_name]
     )
-    optimizer_batches = (
-        input_batches
-        if optimization_input_batches is None
-        else optimization_input_batches
+    optimization_activations = (
+        cached_activations if sampled_activations is None else sampled_activations
     )
     token_count = cache.token_count[mapping.mapping_name]
-    if mode == "sic":
+    if optimization_mode == "sic":
         result = optimize_sic(
             weight,
-            optimizer_batches,
+            optimization_activations,
             cache.hessian[mapping.mapping_name].to(weight.device) / token_count,
             observer=observer,
             alpha_dtype=alpha_dtype,
@@ -67,11 +65,11 @@ def quantize_mapping(
         )
     else:
         sigma_x_squared = (
-            cache.sigma_x_squared[mapping.mapping_name].to(weight.device) / token_count
+            cache.sigma_x_squared_sum[mapping.mapping_name].to(weight.device) / token_count
         )
         result = optimize_rtn(
             weight,
-            optimizer_batches,
+            optimization_activations,
             observer=observer,
             alpha_dtype=alpha_dtype,
             sigma_x_squared=sigma_x_squared,

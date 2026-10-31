@@ -10,18 +10,18 @@ def run_phases(
     mapping,
     cache,
     *,
-    mode,
+    optimization_mode,
     dampening_frac,
     weight_only,
-    optimization_input_batches=None,
+    sampled_activations=None,
 ):
     result = osfp4_quantize.quantize_mapping(
         mapping,
         cache,
-        mode=mode,
+        optimization_mode=optimization_mode,
         dampening_frac=dampening_frac,
         weight_only=weight_only,
-        optimization_input_batches=optimization_input_batches,
+        sampled_activations=sampled_activations,
     )
     scale = smoothing.deploy_mapping_smooth_quant_scale(mapping, result.alpha)
     if not weight_only:

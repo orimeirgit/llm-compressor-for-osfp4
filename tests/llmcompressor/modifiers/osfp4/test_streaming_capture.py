@@ -86,7 +86,10 @@ def test_automatic_count_uses_collated_rows_and_preserves_rng(embeddings):
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("cap", [3, 11, 20])
 @pytest.mark.parametrize("batch_rows", [(6, 5), (0, 2, 0, 9), (1, 1, 1, 8)])
-def test_capture_matches_legacy_bytes_and_statistics(device, cap, batch_rows):
+@pytest.mark.parametrize("optimization_mode", ["rtn", "sic"])
+def test_capture_matches_legacy_bytes_and_statistics(
+    device, cap, batch_rows, optimization_mode
+):
     batches = [
         torch.randn(n, 16, generator=torch.Generator().manual_seed(n))
         for n in batch_rows
@@ -97,10 +100,9 @@ def test_capture_matches_legacy_bytes_and_statistics(device, cap, batch_rows):
     cache = OSFP4CalibrationCache()
     hook = cache.make_capture_hook(
         "x",
-        capture_hessian=True,
-        capture_sigma_x_squared=True,
+        optimization_mode=optimization_mode,
         total_num_tokens=11,
-        subsample_size=cap,
+        activation_subsample_size=cap,
     )
     hessian, energy = torch.zeros(16, 16, device=device), torch.zeros(16, device=device)
     rng = torch.get_rng_state().clone()
@@ -110,15 +112,19 @@ def test_capture_matches_legacy_bytes_and_statistics(device, cap, batch_rows):
         hessian.addmm_(value.T, value)
         energy.add_(value.square().sum(0))
         assert sum(x.shape[0] for x in cache.cached_activations.get("x", ())) <= cap
-    cache.wait("x", torch.device("cpu"))
+    cache.wait_for_capture("x", torch.device("cpu"))
     actual = cache.prepare_sampled_activations("x", output_rows=4)
     assert actual.provenance == expected.provenance
     assert_bytes(
         torch.cat(actual.batches or cache.cached_activations["x"]),
         torch.cat(expected.batches or batches),
     )
-    assert_bytes(cache.hessian["x"], hessian)
-    assert_bytes(cache.sigma_x_squared["x"], energy)
+    if optimization_mode == "sic":
+        assert_bytes(cache.hessian["x"], hessian)
+        assert not cache.sigma_x_squared_sum
+    else:
+        assert_bytes(cache.sigma_x_squared_sum["x"], energy)
+        assert not cache.hessian
     assert_bytes(cache.input_channel_absmax["x"], torch.cat(batches).abs().amax(0))
     assert torch.equal(rng, torch.get_rng_state())
     cache.clear_mapping("x")
@@ -336,7 +342,7 @@ def test_auto_matches_fixed_twice_input_width_for_streaming_and_fallback(rows, w
                     selected = {}
                     for mapping in modifier._resolved_mappings:
                         n = mapping.balance_layers[0].weight.shape[1]
-                        batches = modifier._sample_optimization_inputs(mapping)
+                        batches = modifier._sample_optimization_activations(mapping)
                         selected[mapping.mapping_name] = torch.cat(
                             batches
                             or modifier._calibration.cached_activations[

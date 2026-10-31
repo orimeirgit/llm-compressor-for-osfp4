@@ -77,7 +77,7 @@ def test_partial_deployment_requires_fresh_model_and_modifier(
     assert modifier._deployment_failure == mapping.mapping_name
     assert not torch.equal(first_weight, mapping.balance_layers[0].weight)
     assert mapping.mapping_name not in modifier._optimized_mapping_names
-    assert modifier._calibration.has_observation(mapping.mapping_name)
+    assert modifier._calibration.has_calibration_data(mapping.mapping_name)
     assert "_deployment_failure" not in modifier.model_dump()
     assert not hasattr(model.config, "osfp4_metadata")
 

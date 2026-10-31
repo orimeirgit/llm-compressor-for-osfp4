@@ -27,87 +27,101 @@ class ActivationSubsample:
     provenance: dict[str, int | str]
 
 
-def _select_activation_indices(total_tokens: int, requested_size: int) -> torch.Tensor:
+def _select_activation_indices(
+    total_num_tokens: int, activation_subsample_size: int
+) -> torch.Tensor:
     """Select sorted activation indices without changing global RNG state."""
-    size = min(total_tokens, requested_size)
-    if size == total_tokens:
-        return torch.arange(total_tokens, device="cpu", dtype=torch.int64)
+    num_sampled_tokens = min(total_num_tokens, activation_subsample_size)
+    if num_sampled_tokens == total_num_tokens:
+        return torch.arange(total_num_tokens, device="cpu", dtype=torch.int64)
     generator = torch.Generator(device="cpu")
     generator.manual_seed(_ACTIVATION_SUBSAMPLE_SEED)
-    indices = torch.randperm(
-        total_tokens, generator=generator, device="cpu", dtype=torch.int64
-    )[:size]
-    return indices.sort().values
+    sampled_indices = torch.randperm(
+        total_num_tokens, generator=generator, device="cpu", dtype=torch.int64
+    )[:num_sampled_tokens]
+    return sampled_indices.sort().values
 
 
 def _build_subsample_provenance(
-    indices: torch.Tensor, total_tokens: int, output_rows: int
+    sampled_indices: torch.Tensor, total_num_tokens: int, output_rows: int
 ) -> dict[str, int | str]:
     """Describe the selected activation rows and their source."""
     return {
         "policy": "fixed",
         "seed": _ACTIVATION_SUBSAMPLE_SEED,
         "m": output_rows,
-        "k": indices.numel(),
-        "k1": total_tokens,
-        "index_sha256": hashlib.sha256(indices.numpy().tobytes()).hexdigest(),
+        "k": sampled_indices.numel(),
+        "k1": total_num_tokens,
+        "index_sha256": hashlib.sha256(sampled_indices.numpy().tobytes()).hexdigest(),
     }
 
 
 def _gather_rows(
     batches: Sequence[torch.Tensor],
-    indices: torch.Tensor,
+    sampled_indices: torch.Tensor,
     *,
     pin_memory: bool,
 ) -> torch.Tensor:
     """Collect the selected activation rows from multiple batches into one tensor."""
-    first = batches[0]
-    sampled = torch.empty(
-        (indices.numel(), first.shape[1]),
-        dtype=first.dtype,
+    first_batch = batches[0]
+    sampled_activations = torch.empty(
+        (sampled_indices.numel(), first_batch.shape[1]),
+        dtype=first_batch.dtype,
         device="cpu",
         pin_memory=pin_memory,
     )
     output_start = 0
-    batch_start = 0
+    batch_token_offset = 0
     for batch in batches:
-        batch_end = batch_start + batch.shape[0]
-        begin = int(torch.searchsorted(indices, batch_start, side="left").item())
-        end = int(torch.searchsorted(indices, batch_end, side="left").item())
-        if begin != end:
-            local_indices = indices[begin:end] - batch_start
-            output_end = output_start + local_indices.numel()
-            sampled[output_start:output_end].copy_(batch.index_select(0, local_indices))
+        batch_end = batch_token_offset + batch.shape[0]
+        index_start = int(
+            torch.searchsorted(sampled_indices, batch_token_offset, side="left").item()
+        )
+        index_end = int(
+            torch.searchsorted(sampled_indices, batch_end, side="left").item()
+        )
+        if index_start != index_end:
+            batch_sampled_indices = sampled_indices[index_start:index_end] - batch_token_offset
+            output_end = output_start + batch_sampled_indices.numel()
+            sampled_activations[output_start:output_end].copy_(
+                batch.index_select(0, batch_sampled_indices)
+            )
             output_start = output_end
-        batch_start = batch_end
-    return sampled
+        batch_token_offset = batch_end
+    return sampled_activations
 
 
 def subsample_activations(
     cached_activation_batches: Sequence[torch.Tensor],
-    requested_size: int,
+    activation_subsample_size: int,
     *,
     output_rows: int,
 ) -> ActivationSubsample:
     """Select complete activation rows without changing global RNG state."""
     batches = cached_activation_batches
     dtype = batches[0].dtype
-    total_tokens = 0
+    total_num_tokens = 0
     all_pinned = True
 
     for batch in batches:
         if batch.dtype != dtype:
             raise ValueError("cached activation batches must share one dtype")
-        total_tokens += batch.shape[0]
+        total_num_tokens += batch.shape[0]
         all_pinned = all_pinned and batch.is_pinned()
 
-    indices = _select_activation_indices(total_tokens, requested_size)
-    if indices.numel() == total_tokens:
-        selected = None  # Reuse all original batches without copying.
+    sampled_indices = _select_activation_indices(
+        total_num_tokens, activation_subsample_size
+    )
+    if sampled_indices.numel() == total_num_tokens:
+        sampled_batches = None  # Reuse all original batches without copying.
     else:
-        selected = (_gather_rows(batches, indices, pin_memory=all_pinned),)
+        sampled_batches = (
+            _gather_rows(batches, sampled_indices, pin_memory=all_pinned),
+        )
 
     return ActivationSubsample(
-        batches=selected,
-        provenance=_build_subsample_provenance(indices, total_tokens, output_rows),
+        batches=sampled_batches,
+        provenance=_build_subsample_provenance(
+            sampled_indices, total_num_tokens, output_rows
+        ),
     )
