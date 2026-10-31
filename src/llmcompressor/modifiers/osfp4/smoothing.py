@@ -92,7 +92,8 @@ def update_smoothed_input_global_scale(
     layers = mapping.balance_layers
     observers = [layer.input_observer for layer in layers]
     scale = scale.detach().float().reshape(1, -1)
-    # Discard pre-SmoothQuant statistics before replaying smoothed inputs.
+
+    # Clear statistics collected before applying the smoothing scale.
     for observer in observers:
         for statistic in ("min_vals", "max_vals"):
             if hasattr(observer, statistic):
