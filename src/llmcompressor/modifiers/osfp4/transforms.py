@@ -12,8 +12,8 @@ from compressed_tensors.transform import (
 )
 from torch.nn import Module
 
-TRANSFORM_NAME = "osfp4"
-TRANSFORM_MODULE = "osfp4_input"
+TRANSFORM_NAME = "smooth_quant"
+TRANSFORM_MODULE = "smooth_quant_input"
 
 
 def initialize_diagonal_smoothing(model: Module, targets: list[str]) -> None:

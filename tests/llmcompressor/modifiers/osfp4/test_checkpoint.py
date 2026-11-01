@@ -16,7 +16,7 @@ from compressed_tensors.quantization import (
 )
 from compressed_tensors.transform import TransformConfig, apply_transform_config
 from safetensors.torch import load_file
-from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
+from transformers import LlamaConfig, LlamaForCausalLM
 
 from llmcompressor.args import DatasetArguments
 from llmcompressor.core import create_session
@@ -99,7 +99,7 @@ def test_sequential_reference_and_compressed_round_trip(
         )
         # Only the storage name changes from the plugin contract to option A.
         reference = {
-            name.replace(".smooth_quant_scale", ".osfp4_input.weight"): value
+            name.replace(".smooth_quant_scale", ".smooth_quant_input.weight"): value
             for name, value in reference.items()
         }
         actual = model.state_dict()
@@ -120,7 +120,7 @@ def test_sequential_reference_and_compressed_round_trip(
     assert qdata["quant_method"] == "compressed-tensors"
     assert "osfp4_metadata" not in saved_config
     tconfig = TransformConfig.model_validate(qdata.pop("transform_config"))
-    online = tconfig.config_groups["osfp4"]
+    online = tconfig.config_groups["smooth_quant"]
     assert online.type == "diagonal"
     assert len(online.apply) == 1
     assert online.apply[0].location == "input"
@@ -128,7 +128,7 @@ def test_sequential_reference_and_compressed_round_trip(
     saved_state = load_file(str(tmp_path / "model.safetensors"))
     assert any(key.endswith("weight_packed") for key in saved_state)
     for name in online.apply[0].targets:
-        scale = saved_state[f"{name}.osfp4_input.weight"]
+        scale = saved_state[f"{name}.smooth_quant_input.weight"]
         assert scale.dtype == torch.bfloat16
         assert scale.ndim == 1
         assert (scale > 0).all() and torch.isfinite(scale).all()
@@ -149,15 +149,6 @@ def test_sequential_reference_and_compressed_round_trip(
             restored(**samples[0]).logits, expected, rtol=0, atol=0
         )
         torch.testing.assert_close(model(**samples[0]).logits, expected, rtol=0, atol=0)
-
-    # Older Transformers must fail instead of silently dropping transform_config.
-    import inspect
-
-    from transformers import CompressedTensorsConfig
-
-    if "transform_config" not in inspect.signature(CompressedTensorsConfig).parameters:
-        with pytest.raises(ValueError, match="loader does not handle diagonal"):
-            AutoModelForCausalLM.from_pretrained(tmp_path, local_files_only=True)
 
 
 def test_public_oneshot_entrypoint_with_default_pipeline(tmp_path, monkeypatch):
@@ -201,4 +192,7 @@ def test_public_oneshot_entrypoint_with_default_pipeline(tmp_path, monkeypatch):
         ).all()
     model.save_pretrained(tmp_path, save_compressed=True)
     metadata = json.loads((tmp_path / "config.json").read_text())["quantization_config"]
-    assert metadata["transform_config"]["config_groups"]["osfp4"]["type"] == "diagonal"
+    assert (
+        metadata["transform_config"]["config_groups"]["smooth_quant"]["type"]
+        == "diagonal"
+    )

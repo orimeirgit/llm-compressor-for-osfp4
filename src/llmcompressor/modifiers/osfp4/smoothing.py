@@ -64,7 +64,7 @@ def _deploy_smooth_layer_smoothing(
 
 
 def _deploy_runtime_smoothing(layer: Linear, scale: torch.Tensor) -> torch.Tensor:
-    """Store the BF16 scale in osfp4_input.weight and return its FP32 values."""
+    """Store the BF16 scale in smooth_quant_input.weight and return its FP32 values."""
     deployed_scale = scale.detach().float().to(torch.bfloat16)
     transform = getattr(layer, TRANSFORM_MODULE)
     transform.set_scale(deployed_scale)

@@ -97,8 +97,8 @@ def test_all_modes_finalize(mode):
     for layer in layers:
         assert torch.equal(layer.weight_global_scale, torch.ones(1))
         assert not hasattr(layer, "osfp4_checkpoint_scales")
-    assert block.self_attn.o_proj.osfp4_input.weight.dtype == torch.bfloat16
-    assert block.mlp.down_proj.osfp4_input.weight.dtype == torch.bfloat16
+    assert block.self_attn.o_proj.smooth_quant_input.weight.dtype == torch.bfloat16
+    assert block.mlp.down_proj.smooth_quant_input.weight.dtype == torch.bfloat16
     assert not hasattr(model.lm_head, "quantization_scheme")
     assert not hasattr(modifier, "_energy_cache")
 
@@ -120,7 +120,7 @@ def test_nvfp4a16_all_modes_optimize_and_finalize(mode):
         assert layer.quantization_scheme.input_activations is None
 
     modifier.on_finalize(State(model=model))
-    assert model.transform_config.config_groups["osfp4"].type == "diagonal"
+    assert model.transform_config.config_groups["smooth_quant"].type == "diagonal"
     assert not hasattr(model.config, "osfp4_metadata")
 
 
@@ -153,7 +153,7 @@ def test_sic_mode_is_used_end_to_end(monkeypatch):
     ]
     assert modifier.optimization_mode == "sic"
     modifier.on_finalize(State(model=model))
-    assert model.transform_config.config_groups["osfp4"].type == "diagonal"
+    assert model.transform_config.config_groups["smooth_quant"].type == "diagonal"
 
 
 def test_sic_installs_scale_times_fp4_code_before_qparams():
@@ -199,7 +199,7 @@ def test_sic_finalizes_with_minimal_runtime_metadata():
     modifier.on_finalize(State(model=model))
 
     assert not hasattr(model.config, "osfp4_metadata")
-    assert set(model.transform_config.config_groups) == {"osfp4"}
+    assert set(model.transform_config.config_groups) == {"smooth_quant"}
     state_names = tuple(model.state_dict())
     assert not any(
         token in name
@@ -237,7 +237,9 @@ def test_global_scales_use_exact_post_alpha_calibration_absmax():
         model(batch)
     cached = {
         mapping_name: [value.clone() for value in values]
-        for mapping_name, values in modifier._calibration_cache.cached_activations.items()
+        for mapping_name, values in (
+            modifier._calibration_cache.cached_activations.items()
+        )
     }
     modifier.on_sequential_epoch_end(state, event, list(model.modules()))
     modifier.on_calibration_end(state, event)
@@ -246,7 +248,7 @@ def test_global_scales_use_exact_post_alpha_calibration_absmax():
     for mapping in modifier._resolved_mappings:
         if mapping.requires_runtime_smoothing:
             deployed_smooth_quant_scale = (
-                mapping.balance_layers[0].osfp4_input.weight.float().cpu()
+                mapping.balance_layers[0].smooth_quant_input.weight.float().cpu()
             )
         else:
             deployed_smooth_quant_scale = (
