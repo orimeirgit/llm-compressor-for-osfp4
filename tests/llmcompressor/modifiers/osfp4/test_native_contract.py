@@ -173,6 +173,34 @@ def test_dense_only_and_distributed_guards(monkeypatch):
         make_osfp4_modifier().on_initialize(State(model=LlamaForCausalLM()))
 
 
+@pytest.mark.parametrize("linearized", [False, True])
+def test_moe_modules_rejected_without_config(linearized):
+    from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+
+    from llmcompressor.modeling.moe.linearize import linearize_moe
+
+    config = Qwen3MoeConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=32,
+        moe_intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_experts=2,
+        num_experts_per_tok=1,
+    )
+    source = Qwen3MoeForCausalLM(config)
+    if linearized:
+        linearize_moe(source)
+    model = torch.nn.Module()
+    model.experts = source.model.layers[0].mlp.experts
+    assert not hasattr(model, "config")
+    with pytest.raises(ValueError, match="supports dense models only"):
+        make_osfp4_modifier().on_initialize(State(model=model))
+    assert not any("smooth_quant_input" in name for name, _ in model.named_modules())
+
+
 def test_missing_dependency_fails_clearly(monkeypatch):
     monkeypatch.setattr(TransformFactory, "registered_names", lambda: [])
     with pytest.raises(ImportError, match="diagonal transform support"):

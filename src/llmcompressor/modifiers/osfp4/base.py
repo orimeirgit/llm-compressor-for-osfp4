@@ -25,6 +25,10 @@ from torch.utils._pytree import tree_leaves
 from tqdm import tqdm
 
 from llmcompressor.core import Event, State, active_session
+from llmcompressor.modeling.moe.linearize import (
+    get_linearized_moes,
+    get_non_linearized_moes,
+)
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.quantization.calibration import update_qparams
 from llmcompressor.modifiers.quantization.quantization import QuantizationMixin
@@ -250,7 +254,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         config = getattr(state.model, "config", None)
         if config is not None and hasattr(config, "get_text_config"):
             config = config.get_text_config()
-        if any(
+        has_moe_config = any(
             getattr(config, name, 0) or 0
             for name in (
                 "num_experts",
@@ -258,8 +262,13 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
                 "moe_num_experts",
                 "n_routed_experts",
             )
+        )
+        if (
+            get_linearized_moes(state.model)
+            or get_non_linearized_moes(state.model)
+            or has_moe_config
         ):
-            raise ValueError("OSFP4 initially supports dense models only")
+            raise ValueError("OSFP4 on this branch supports dense models only")
 
     def _resolve_mappings(self, model: Module) -> list[OSFP4Mapping]:
         """Group selected Linear layers into smooth-layer mappings and create runtime
