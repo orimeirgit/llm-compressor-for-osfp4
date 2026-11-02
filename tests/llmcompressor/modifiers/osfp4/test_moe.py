@@ -214,7 +214,11 @@ def test_expert_capture_and_input_scales(all_tokens, mode):
                 cache.hessian[mapping.mapping_name],
                 observed.float().T @ observed.float(),
             )
-        assert (mapping.mapping_name in cache.sampled_indices) == all_tokens
+        assert mapping.mapping_name in cache.sampled_indices
+        assert (
+            sum(len(batch) for batch in cache.cached_activations[mapping.mapping_name])
+            <= 2
+        )
         if all_tokens:
             retained = torch.cat(cache.cached_activations[mapping.mapping_name])
             assert retained.abs().max() < observed.abs().max()
@@ -561,3 +565,71 @@ def test_oneshot_honors_expert_calibration_mode(all_tokens, tmp_path, monkeypatc
         assert torch.isfinite(
             model(input_ids=torch.arange(16).reshape(1, -1)).logits
         ).all()
+
+
+@pytest.mark.parametrize("mode", ["rtn", "sic"])
+@pytest.mark.parametrize("sample_size", [4, "auto"])
+@pytest.mark.parametrize("countable_loader", [False, True])
+def test_routed_expert_reservoir_preserves_input_scale(
+    mode, sample_size, countable_loader
+):
+    """An excluded outlier must still determine the deployed input global scale."""
+    import random
+
+    model = make_model()
+    modifier = make_modifier(
+        scheme="NVFP4",
+        optimization_mode=mode,
+        activation_subsample_size=sample_size,
+    )
+    loader = [{"input_ids": torch.zeros((1, 16), dtype=torch.long)} for _ in range(8)]
+    state = State(model=model)
+    modifier.on_initialize(
+        state, calib_data=loader if countable_loader else iter(loader)
+    )
+    modifier.on_calibration_start(state, Event())
+    mapping = next(m for m in modifier._resolved_mappings if m.is_expert)
+    cap = 64 if sample_size == "auto" else sample_size
+    selected = list(range(cap))
+    rng = random.Random(42)
+    for index in range(cap, 128):
+        slot = rng.randrange(index + 1)
+        if slot < cap:
+            selected[slot] = index
+    excluded = next(index for index in range(128) if index not in selected)
+    rows = torch.ones((128, 32), dtype=torch.bfloat16)
+    rows[excluded, 5] = 100
+    cache = modifier._calibration_cache
+    name = mapping.mapping_name
+    try:
+        experts = model.model.layers[0].mlp.experts
+        with torch.no_grad():
+            for batch in rows.split(16):
+                experts(
+                    batch,
+                    torch.tensor([[0, 1]] * len(batch)),
+                    torch.full((len(batch), 2), 0.5),
+                )
+                assert len(cache.cached_activations[name][0]) <= cap
+                assert (
+                    cache.cached_activations[name][0].untyped_storage().nbytes()
+                    == cap * 32 * 2
+                )
+        assert name in cache.reservoirs
+        assert cache.token_count[name] == 128
+        sampled = modifier._prepare_optimization_activations(mapping)
+        assert torch.cat(sampled).abs().max().item() == 1
+        assert cache.input_channel_absmax[name][5].item() == 100
+        deployed = deploy_mapping_smooth_quant_scale(
+            mapping, torch.linspace(0.613, 1.713, 32)
+        )
+        update_smoothed_input_global_scale(mapping, cache, deployed)
+        maximum = (rows.float() * deployed).abs().max().reshape(1)
+        expected = generate_gparam(-maximum, maximum)
+        for layer in mapping.balance_layers:
+            assert_bytes(
+                layer.input_global_scale, expected.to(layer.input_global_scale)
+            )
+    finally:
+        modifier.remove_hooks()
+        cache.clear_all()

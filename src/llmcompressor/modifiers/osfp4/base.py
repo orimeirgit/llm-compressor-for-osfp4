@@ -113,9 +113,10 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
     Every calibration token contributes to the RTN or SIC statistics.
     NVFP4 also caches activation values to evaluate reconstruction loss during
     optimization. When subsampling is enabled, capture stores only the selected
-    token rows where possible. Otherwise, it stores all rows and selects the
-    subset before optimization. NVFP4A16 uses statistics without caching
-    activation values.
+    token rows where possible. Routed experts use a bounded reservoir because
+    their token counts are unknown in advance. Other unsupported capture paths
+    store all rows and select the subset before optimization. NVFP4A16 uses
+    statistics without caching activation values.
 
     Smoothing multiplies each mapping's input channels by the deployed scale
     and divides the corresponding weight columns in every balance layer by
@@ -463,7 +464,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         ):
             logger.warning(
                 "OSFP4 cannot count calibration token rows; "
-                "using full activation caching"
+                "using full activation caching where bounded capture is unavailable"
             )
         self._setup_capture_hooks(total_num_tokens)
 
@@ -478,11 +479,9 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         for mapping, activation_subsample_size in zip(
             self._resolved_mappings, activation_subsample_sizes
         ):
-            subsample_during_capture = (
-                total_num_tokens is not None
-                and activation_subsample_size is not None
+            can_subsample = (
+                activation_subsample_size is not None
                 and not self._weight_only
-                and (not mapping.is_expert or get_calibrate_all_experts_flag())
                 and all(
                     type(getattr(layer, "input_observer", None)) is StaticMinMaxObserver
                     and layer.input_observer.args.strategy
@@ -490,6 +489,11 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
                     and layer.input_observer.args.dynamic == DynamicType.LOCAL
                     for layer in mapping.balance_layers
                 )
+            )
+            routed_expert = mapping.is_expert and not get_calibrate_all_experts_flag()
+            # Routed expert counts are unknown until routing finishes.
+            subsample_during_capture = (
+                can_subsample and total_num_tokens is not None and not routed_expert
             )
             self.register_hook(
                 mapping.balance_layers[0],
@@ -501,6 +505,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
                     if subsample_during_capture
                     else None,
                     activation_subsample_size=activation_subsample_size,
+                    reservoir_sampling=can_subsample and routed_expert,
                 ),
                 "forward_pre",
             )

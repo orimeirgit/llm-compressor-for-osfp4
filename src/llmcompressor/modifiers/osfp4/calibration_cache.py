@@ -9,6 +9,7 @@ import torch
 from torch.nn import Linear
 
 from .activation_subsampling import (
+    ActivationReservoir,
     ActivationSubsample,
     _build_subsample_provenance,
     _select_activation_indices,
@@ -30,7 +31,8 @@ class OSFP4CalibrationCache:
     rows are cached to evaluate quantization reconstruction loss during
     optimization. Preparation waits for capture to finish and combines sampled
     batches for optimization. Weight-only calibration stores statistics without
-    caching activations.
+    caching activations. Routed experts with unknown token counts use a bounded
+    reservoir when subsampling is enabled; all-token statistics remain unchanged.
     """
 
     offload_hessians: bool = False
@@ -54,8 +56,12 @@ class OSFP4CalibrationCache:
 
     cached_activations: dict[str, list[torch.Tensor]] = field(default_factory=dict)
 
+    # Sampling state for routed experts whose final token counts are unknown.
+    reservoirs: dict[str, ActivationReservoir] = field(default_factory=dict)
+
     def clear_all(self) -> None:
         """Clear all cached calibration data and capture streams."""
+        self.reservoirs.clear()
         self.cached_activations.clear()
         self.capture_events.clear()
         self.hessian.clear()
@@ -74,12 +80,22 @@ class OSFP4CalibrationCache:
         cache_activations: bool = True,
         total_num_tokens: int | None = None,
         activation_subsample_size: int | None = None,
+        reservoir_sampling: bool = False,
     ) -> Callable[[Linear, tuple[torch.Tensor, ...]], None]:
         """Create a per-batch hook to collect calibration statistics and activations.
 
         Use all tokens for SIC/RTN statistics and retain activation rows as configured.
         The caller registers the returned hook on the mapping's first balance layer.
         """
+        if reservoir_sampling and (
+            not cache_activations
+            or total_num_tokens is not None
+            or activation_subsample_size is None
+            or activation_subsample_size <= 0
+        ):
+            raise ValueError(
+                "Reservoir capture requires a positive cap and unknown token count"
+            )
         subsample_during_capture = (
             cache_activations
             and total_num_tokens is not None
@@ -106,7 +122,17 @@ class OSFP4CalibrationCache:
             batch_token_offset = self.token_count.get(mapping_name, 0)
             self.token_count[mapping_name] = batch_token_offset + activation_rows.shape[0]
             batch_sampled_indices = None
-            if subsample_during_capture:
+            reservoir_slots = None
+            if reservoir_sampling:
+                if mapping_name not in self.reservoirs:
+                    self.reservoirs[mapping_name] = ActivationReservoir(
+                        activation_subsample_size
+                    )
+                reservoir = self.reservoirs[mapping_name]
+                reservoir_slots, batch_sampled_indices = reservoir.select_batch(
+                    batch_token_offset, activation_rows.shape[0]
+                )
+            elif subsample_during_capture:
                 batch_sampled_indices = self._get_batch_sampled_indices(
                     mapping_name,
                     activation_rows,
@@ -132,7 +158,9 @@ class OSFP4CalibrationCache:
                     batch_sampled_indices,
                     retain_activations=retain_activations,
                     optimization_mode=optimization_mode,
-                    subsample_during_capture=subsample_during_capture,
+                    subsample_during_capture=(
+                        subsample_during_capture or reservoir_sampling
+                    ),
                 )
             else:
                 self._accumulate_calibration_statistics(
@@ -141,7 +169,9 @@ class OSFP4CalibrationCache:
                     activations,
                     activation_rows,
                     optimization_mode=optimization_mode,
-                    subsample_during_capture=subsample_during_capture,
+                    subsample_during_capture=(
+                        subsample_during_capture or reservoir_sampling
+                    ),
                 )
                 cached_batch = None
                 if retain_activations:
@@ -153,11 +183,47 @@ class OSFP4CalibrationCache:
                         ).cpu()
                     )
             if cached_batch is not None:
-                self.cached_activations.setdefault(mapping_name, []).append(
-                    cached_batch
-                )
+                if reservoir_sampling:
+                    self._update_activation_reservoir(
+                        mapping_name, reservoir_slots, cached_batch
+                    )
+                else:
+                    self.cached_activations.setdefault(mapping_name, []).append(
+                        cached_batch
+                    )
 
         return capture_calibration_batch_hook
+
+    def _update_activation_reservoir(
+        self,
+        mapping_name: str,
+        slots: torch.Tensor,
+        selected_activations: torch.Tensor,
+    ) -> None:
+        """Replace reservoir slots after their selected rows have reached the CPU."""
+        self.wait_for_capture(mapping_name, torch.device("cpu"))
+        reservoir = self.reservoirs[mapping_name]
+        batches = self.cached_activations.get(mapping_name)
+        if batches is None:
+            buffer = torch.empty(
+                (reservoir.cap, selected_activations.shape[1]),
+                dtype=selected_activations.dtype,
+                device="cpu",
+                pin_memory=selected_activations.is_pinned(),
+            )
+        else:
+            buffer = batches[0]
+            if buffer.dtype != selected_activations.dtype:
+                raise ValueError("cached activation batches must share one dtype")
+            # Expose the full fixed allocation behind the populated prefix view.
+            buffer = buffer.as_strided(
+                (reservoir.cap, buffer.shape[1]), buffer.stride()
+            )
+        buffer.index_copy_(0, slots, selected_activations)
+        self.cached_activations[mapping_name] = [buffer[: len(reservoir.indices)]]
+        self.sampled_indices[mapping_name] = torch.tensor(
+            reservoir.indices, dtype=torch.int64
+        )
 
     def _get_batch_sampled_indices(
         self,
@@ -308,7 +374,16 @@ class OSFP4CalibrationCache:
         if mapping_name not in self.sampled_indices:
             return
         token_count = self.token_count.get(mapping_name, 0)
-        total_num_tokens = self.total_num_tokens[mapping_name]
+        reservoir = self.reservoirs.get(mapping_name)
+        total_num_tokens = (
+            token_count
+            if reservoir is not None
+            else self.total_num_tokens[mapping_name]
+        )
+        if reservoir is not None and len(reservoir.indices) != min(
+            reservoir.cap, token_count
+        ):
+            raise ValueError(f"OSFP4 {mapping_name}: incorrect reservoir size")
         if token_count != total_num_tokens:
             raise ValueError(
                 f"OSFP4 {mapping_name}: expected {total_num_tokens} calibration tokens, got {token_count}"
@@ -324,13 +399,28 @@ class OSFP4CalibrationCache:
     def prepare_sampled_activations(self, mapping_name: str, output_rows: int) -> ActivationSubsample:
         """Wait, validate, and combine already sampled rows for optimization.
 
-        Return the subset and sampling metadata, or no subset if all tokens were kept.
+        Return sampling metadata alongside the rows in token order. Known-count
+        capture returns no subset when the caller can reuse all cached batches.
         """
         self.wait_for_capture(mapping_name, torch.device("cpu"))
         self.validate_sampling(mapping_name)
         sampled_indices = self.sampled_indices[mapping_name]
-        total_num_tokens = self.total_num_tokens[mapping_name]
+        reservoir = self.reservoirs.get(mapping_name)
+        total_num_tokens = (
+            self.token_count[mapping_name]
+            if reservoir is not None
+            else self.total_num_tokens[mapping_name]
+        )
         cached_activations = self.cached_activations[mapping_name]
+        if reservoir is not None:
+            order = torch.argsort(sampled_indices)
+            sampled_indices = sampled_indices[order]
+            sampled = cached_activations[0].index_select(0, order)
+            provenance = _build_subsample_provenance(
+                sampled_indices, total_num_tokens, output_rows
+            )
+            provenance["algorithm"] = "reservoir"
+            return ActivationSubsample((sampled,), provenance)
         provenance = _build_subsample_provenance(
             sampled_indices, total_num_tokens, output_rows
         )
@@ -362,6 +452,7 @@ class OSFP4CalibrationCache:
 
     def clear_mapping(self, mapping_name: str) -> None:
         """Clear cached calibration data for one mapping."""
+        self.reservoirs.pop(mapping_name, None)
         self.cached_activations.pop(mapping_name, None)
         self.capture_events.pop(mapping_name, None)
         self.hessian.pop(mapping_name, None)

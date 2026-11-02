@@ -16,6 +16,7 @@ import torch
 from torch.utils.data import IterableDataset
 
 __all__ = [
+    "ActivationReservoir",
     "ActivationSubsample",
     "count_calibration_tokens",
     "subsample_activations",
@@ -177,3 +178,40 @@ def subsample_activations(
             sampled_indices, total_num_tokens, output_rows
         ),
     )
+
+
+class ActivationReservoir:
+    """Select at most cap rows from an unknown-length stream using Algorithm R.
+
+    A private RNG makes selection independent of model RNGs and batch boundaries.
+    Replacements targeting the same slot within a batch keep only the last row.
+    """
+
+    def __init__(self, cap: int) -> None:
+        if cap <= 0:
+            raise ValueError("activation sample size must be positive")
+        self.cap = cap
+        self.indices: list[int] = []
+        self.generator = random.Random(_ACTIVATION_SUBSAMPLE_SEED)
+
+    def select_batch(
+        self, offset: int, num_rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return unique destination slots and their final source rows in this batch."""
+        replacements: dict[int, int] = {}
+        for row in range(num_rows):
+            index = offset + row
+            if index < self.cap:
+                slot = index
+                self.indices.append(index)
+            else:
+                slot = self.generator.randrange(index + 1)
+                if slot >= self.cap:
+                    continue
+                self.indices[slot] = index
+            replacements[slot] = row
+        slots = sorted(replacements)
+        return (
+            torch.tensor(slots, dtype=torch.int64),
+            torch.tensor([replacements[slot] for slot in slots], dtype=torch.int64),
+        )
