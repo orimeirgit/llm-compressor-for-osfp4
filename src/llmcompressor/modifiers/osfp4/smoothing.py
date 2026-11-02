@@ -29,7 +29,10 @@ def deploy_mapping_smooth_quant_scale(
     scale = scale.reshape(-1).to(device=balance_layers[0].weight.device)
 
     if mapping.requires_runtime_smoothing:
-        return _deploy_runtime_smoothing(balance_layers[0], scale)
+        deployed_scale = _deploy_runtime_smoothing(balance_layers[0], scale)
+        for layer in balance_layers[1:]:
+            _deploy_runtime_smoothing(layer, deployed_scale)
+        return deployed_scale
 
     return _deploy_smooth_layer_smoothing(mapping.smooth_layer, balance_layers, scale)
 

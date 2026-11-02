@@ -101,6 +101,8 @@ class OSFP4CalibrationCache:
             """
             activations = args[0].detach()
             activation_rows = activations.reshape(-1, activations.shape[-1])
+            if activation_rows.shape[0] == 0:
+                return
             batch_token_offset = self.token_count.get(mapping_name, 0)
             self.token_count[mapping_name] = batch_token_offset + activation_rows.shape[0]
             batch_sampled_indices = None
@@ -298,10 +300,8 @@ class OSFP4CalibrationCache:
         return capture_stream
 
     def has_calibration_data(self, mapping_name: str) -> bool:
-        """Return whether the mapping has processed tokens or cached activation batches."""
-        return self.token_count.get(mapping_name, 0) > 0 or bool(
-            self.cached_activations.get(mapping_name)
-        )
+        """Return whether the mapping has processed any token rows."""
+        return self.token_count.get(mapping_name, 0) > 0
 
     def validate_sampling(self, mapping_name: str) -> None:
         """Check token and retained-row counts match the streaming sampling plan."""

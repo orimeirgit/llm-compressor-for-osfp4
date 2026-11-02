@@ -95,7 +95,7 @@ def test_capture_preserves_exact_statistics_and_input_bytes(
 
 @pytest.mark.parametrize("cache_activations", [False, True])
 @pytest.mark.parametrize("optimization_mode", ["rtn", "sic"])
-def test_empty_capture_preserves_readiness_semantics(
+def test_empty_capture_waits_for_real_tokens(
     cache_activations, optimization_mode
 ):
     cache = OSFP4CalibrationCache()
@@ -108,19 +108,19 @@ def test_empty_capture_preserves_readiness_semantics(
         cache_activations=cache_activations,
     )(layer, (batch,))
 
-    assert cache.token_count["mapping"] == 0
-    if optimization_mode == "sic":
-        assert _tensor_bytes(cache.hessian["mapping"]) == _tensor_bytes(
-            torch.zeros(16, 16)
-        )
-        assert not cache.sigma_x_squared_sum
-    else:
-        assert _tensor_bytes(cache.sigma_x_squared_sum["mapping"]) == _tensor_bytes(
-            torch.zeros(16)
-        )
-        assert not cache.hessian
-    assert cache.has_calibration_data("mapping") is cache_activations
-    assert "mapping" not in cache.capture_events
+    assert not cache.token_count
+    assert not cache.hessian
+    assert not cache.sigma_x_squared_sum
+    assert not cache.cached_activations
+    assert not cache.has_calibration_data("mapping")
+    assert not cache.capture_events
+    cache.make_capture_hook(
+        "mapping", optimization_mode=optimization_mode,
+        cache_activations=cache_activations,
+    )(layer, (torch.ones(2, 16),))
+    assert cache.token_count["mapping"] == 2
+    assert cache.has_calibration_data("mapping")
+
 
 
 @pytest.mark.parametrize("optimization_mode", ["rtn", "sic"])

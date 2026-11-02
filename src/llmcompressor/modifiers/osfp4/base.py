@@ -25,6 +25,11 @@ from torch.utils._pytree import tree_leaves
 from tqdm import tqdm
 
 from llmcompressor.core import Event, State, active_session
+from llmcompressor.modeling.moe.context import get_calibrate_all_experts_flag
+from llmcompressor.modeling.moe.linearize import (
+    get_linearized_moes,
+    get_non_linearized_moes,
+)
 from llmcompressor.modifiers import Modifier
 from llmcompressor.modifiers.quantization.calibration import update_qparams
 from llmcompressor.modifiers.quantization.quantization import QuantizationMixin
@@ -48,6 +53,13 @@ __all__ = ["OSFP4Mapping", "OSFP4Modifier"]
 
 _OSFP4_OBSERVER = "osfp4"
 
+# Relative targets, resolved within each expert in this order.
+_EXPERT_BALANCE_GROUPS = (
+    ("gate_proj", "up_proj"),
+    ("down_proj",),
+)
+_OPTIONAL_EXPERT_PROJECTIONS = frozenset({"gate_proj"})
+
 
 @dataclass(frozen=True, slots=True)
 class OSFP4Mapping:
@@ -56,6 +68,7 @@ class OSFP4Mapping:
     mapping_name: str
     smooth_layer: Module | None
     balance_layers: tuple[Linear, ...]
+    is_expert: bool = False
 
     @property
     def requires_runtime_smoothing(self) -> bool:
@@ -69,8 +82,9 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
     """Apply OSFP4 optimization to NVFP4 or NVFP4A16 quantization using RTN or SIC.
 
     Each mapping is optimized jointly. It contains Linear layers sharing a
-    preceding smooth layer, or one Linear layer requiring a runtime input
-    transform.
+    preceding smooth layer, or runtime input transforms. Expert gate/up
+    projections share one mapping; each expert down projection has its own.
+    LLMC controls whether experts observe every token or only their routed tokens.
 
     Lifecycle:
         1. on_initialize:
@@ -211,12 +225,14 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         # State may contain a deep copy; count the loader the pipeline will consume.
         self._calibration_dataloader = kwargs.get("calib_data", state.data.calib)
         self._calibration_cache.offload_hessians = self.offload_hessians
+        module_names = get_module_to_name_dict(state.model)
         initialize_diagonal_smoothing(
             state.model,
             [
-                mapping.mapping_name
+                module_names[layer]
                 for mapping in self._resolved_mappings
                 if mapping.requires_runtime_smoothing
+                for layer in mapping.balance_layers
             ],
         )
         QuantizationMixin.initialize_quantization(self, state.model)
@@ -247,19 +263,10 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         ):
             if len(recipe.modifiers) != 1:
                 raise ValueError("OSFP4 must be the only modifier in its recipe")
-        config = getattr(state.model, "config", None)
-        if config is not None and hasattr(config, "get_text_config"):
-            config = config.get_text_config()
-        if any(
-            getattr(config, name, 0) or 0
-            for name in (
-                "num_experts",
-                "num_local_experts",
-                "moe_num_experts",
-                "n_routed_experts",
+        if get_non_linearized_moes(state.model):
+            raise ValueError(
+                "OSFP4 requires linearized experts; use oneshot or linearize_moe first"
             )
-        ):
-            raise ValueError("OSFP4 initially supports dense models only")
 
     def _resolve_mappings(self, model: Module) -> list[OSFP4Mapping]:
         """Group selected Linear layers into smooth-layer mappings and create runtime
@@ -279,10 +286,14 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
             )
         selected_balance_layers = {layer for _, layer in selected}
         module_names = get_module_to_name_dict(model)
-        mappings = self._resolve_smooth_layer_mappings(
+        expert_mappings, expert_layers = self._resolve_expert_mappings(
             model, selected_balance_layers, module_names
         )
+        mappings = self._resolve_smooth_layer_mappings(
+            model, selected_balance_layers - expert_layers, module_names
+        )
         smooth_layer_count = len(mappings)
+        mappings.extend(expert_mappings)
         covered = {layer for mapping in mappings for layer in mapping.balance_layers}
         mappings.extend(
             OSFP4Mapping(
@@ -300,6 +311,84 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
             "runtime mappings"
         )
         return mappings
+
+    def _resolve_expert_mappings(
+        self,
+        model: Module,
+        selected_balance_layers: set[Module],
+        module_names: dict[Module, str],
+    ) -> tuple[list[OSFP4Mapping], set[Module]]:
+        """Group expert projections without folding their scales into a shared norm.
+
+        Inspect the linearized expert block and its shared experts. Return all expert
+        projections, including ignored ones, to exclude them from norm folding.
+        """
+        mappings = []
+        expert_layers: set[Module] = set()
+        visited: set[Module] = set()
+        for experts_name, experts in get_linearized_moes(model):
+            parent_name = experts_name.rpartition(".")[0]
+            parent = model.get_submodule(parent_name) if parent_name else model
+            candidates = {
+                experts[index]: self._match_expert_balance_groups(experts[index])
+                for index in range(experts.num_experts)
+            }
+            # Shared experts are ordinary MLPs alongside the routed expert container.
+            for module in parent.modules():
+                if module not in candidates:
+                    groups = self._match_expert_balance_groups(module)
+                    if groups is not None:
+                        candidates[module] = groups
+            for expert, groups in candidates.items():
+                if expert in visited:
+                    continue
+                visited.add(expert)
+                if groups is None:
+                    raise ValueError(
+                        f"OSFP4 expert {module_names[expert]!r} requires Linear "
+                        f"projections matching {_EXPERT_BALANCE_GROUPS}"
+                    )
+                for balance_layers in groups:
+                    expert_layers.update(balance_layers)
+                    selected = set(balance_layers) & selected_balance_layers
+                    if not selected:
+                        continue
+                    if selected != set(balance_layers):
+                        raise ValueError(
+                            f"OSFP4 expert {module_names[expert]!r} requires the "
+                            "projections in each balance group to be selected together"
+                        )
+                    mappings.append(
+                        OSFP4Mapping(
+                            mapping_name=module_names[balance_layers[0]],
+                            smooth_layer=None,
+                            balance_layers=balance_layers,
+                            is_expert=True,
+                        )
+                    )
+        return mappings, expert_layers
+
+    @staticmethod
+    def _match_expert_balance_groups(
+        expert: Module,
+    ) -> tuple[tuple[Linear, ...], ...] | None:
+        """Resolve projection targets in definition order, or reject the layout.
+
+        Matching each target separately preserves gate/up order regardless of module
+        registration order. Ungated experts may omit the optional gate target.
+        """
+        groups = []
+        for targets in _EXPERT_BALANCE_GROUPS:
+            layers = []
+            for target in targets:
+                matches = [layer for _, layer in match_named_modules(expert, [target])]
+                if not matches and target not in _OPTIONAL_EXPERT_PROJECTIONS:
+                    return None
+                if any(not isinstance(layer, Linear) for layer in matches):
+                    return None
+                layers.extend(matches)
+            groups.append(tuple(dict.fromkeys(layers)))
+        return tuple(groups)
 
     def _resolve_smooth_layer_mappings(
         self,
@@ -393,6 +482,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
                 total_num_tokens is not None
                 and activation_subsample_size is not None
                 and not self._weight_only
+                and (not mapping.is_expert or get_calibrate_all_experts_flag())
                 and all(
                     type(getattr(layer, "input_observer", None)) is StaticMinMaxObserver
                     and layer.input_observer.args.strategy
@@ -617,7 +707,9 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         if missing_mapping_names:
             raise RuntimeError(
                 "OSFP4 calibration did not observe every required registry mapping; "
-                f"missing {missing_mapping_names}. Use oneshot(..., pipeline='sequential')."
+                f"missing {missing_mapping_names}. Ensure calibration reaches every "
+                "selected mapping; for routed experts, consider "
+                "moe_calibrate_all_experts=True."
             )
 
     # Deployment failure handling

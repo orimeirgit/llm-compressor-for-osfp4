@@ -161,13 +161,9 @@ def test_observer_configuration_survives_recipe_reload_and_repeated_resolution(
             }
 
 
-def test_dense_only_and_distributed_guards(monkeypatch):
+def test_distributed_guard(monkeypatch):
     from llmcompressor.modifiers.osfp4 import base
 
-    model = LlamaForCausalLM()
-    model.config.num_local_experts = 8
-    with pytest.raises(ValueError, match="dense"):
-        make_osfp4_modifier().on_initialize(State(model=model))
     monkeypatch.setattr(base, "is_distributed", lambda: True)
     with pytest.raises(NotImplementedError, match="single-process"):
         make_osfp4_modifier().on_initialize(State(model=LlamaForCausalLM()))
