@@ -14,6 +14,7 @@ from llmcompressor.observers import Observer
 from llmcompressor.observers.osfp4 import OptimizedQuantizationGroupScales
 from llmcompressor.observers.osfp4 import observer as osfp4_observer
 from llmcompressor.observers.osfp4.observer import _optimize_joint_scales
+from llmcompressor.observers.osfp4.scale_optimization import run_optimizer
 
 
 def _make_observer(
@@ -82,7 +83,7 @@ def _legacy_optimize_joint_scales(weight, activations, *, steps, lr):
             coefficients,
         ).sum()
 
-    osfp4_observer.run_optimizer(
+    run_optimizer(
         parameters,
         evaluate_loss,
         steps=steps,
