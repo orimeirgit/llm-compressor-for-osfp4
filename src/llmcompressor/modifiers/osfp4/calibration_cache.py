@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the OSFP4 and vLLM projects
 
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
@@ -17,6 +18,88 @@ from .activation_subsampling import (
 from .optimization.sic import accumulate_hessian, make_empty_hessian
 
 __all__ = ["OSFP4CalibrationCache"]
+
+
+@dataclass
+class _PendingReservoirCapture:
+    mapping_name: str
+    slots: torch.Tensor
+    populated_length: int
+    buffer: torch.Tensor
+    rows: torch.Tensor
+    event: torch.Event
+    source_indices: torch.Tensor | None = None
+
+
+class _ReservoirCaptureQueue:
+    """Bound pinned staging storage and commit completed copies in FIFO order."""
+
+    def __init__(
+        self,
+        commit: Callable[[_PendingReservoirCapture], None],
+        max_bytes: int = 64 * 1024 * 1024,
+        max_entries: int = 64,
+    ):
+        self.commit = commit
+        self.max_bytes = max_bytes
+        self.max_entries = max_entries
+        self.pending: deque[_PendingReservoirCapture] = deque()
+        self.pool: list[torch.Tensor] = []
+        self.allocated_bytes = 0
+
+    def _commit_oldest(self, *, wait: bool) -> bool:
+        entry = self.pending[0]
+        if wait:
+            entry.event.synchronize()
+        elif not entry.event.query():
+            return False
+        self.commit(entry)
+        self.pending.popleft()
+        self.pool.append(entry.buffer)
+        return True
+
+    def poll(self) -> None:
+        while self.pending and self._commit_oldest(wait=False):
+            pass
+
+    def drain(self, mapping_name: str | None = None) -> None:
+        while self.pending and (
+            mapping_name is None
+            or any(entry.mapping_name == mapping_name for entry in self.pending)
+        ):
+            self._commit_oldest(wait=True)
+
+    def acquire(
+        self, numel: int, dtype: torch.dtype, *, pin_memory: bool = True
+    ) -> torch.Tensor | None:
+        """Return a reusable flat buffer, or None for an oversized synchronous copy."""
+        required_bytes = numel * dtype.itemsize
+        self.poll()
+        if required_bytes > self.max_bytes:
+            self.drain()
+            return None
+        while len(self.pending) >= self.max_entries:
+            self._commit_oldest(wait=True)
+        while True:
+            candidates = [
+                (buffer.numel(), index)
+                for index, buffer in enumerate(self.pool)
+                if buffer.dtype == dtype and buffer.numel() >= numel
+            ]
+            if candidates:
+                return self.pool.pop(min(candidates)[1])
+            # Idle, incompatible buffers must not prevent a new allocation.
+            while self.pool and self.allocated_bytes + required_bytes > self.max_bytes:
+                buffer = self.pool.pop()
+                self.allocated_bytes -= buffer.numel() * buffer.element_size()
+                del buffer
+            if self.allocated_bytes + required_bytes <= self.max_bytes:
+                buffer = torch.empty(
+                    numel, dtype=dtype, device="cpu", pin_memory=pin_memory
+                )
+                self.allocated_bytes += required_bytes
+                return buffer
+            self._commit_oldest(wait=True)
 
 
 @dataclass
@@ -45,7 +128,9 @@ class OSFP4CalibrationCache:
     # CUDA queues for accumulating statistics and copying activations to CPU.
     capture_streams: dict[torch.device, torch.Stream] = field(default_factory=dict)
     # Completion markers used to wait until captured data is ready to use.
-    capture_events: dict[str, dict[torch.device, torch.Event]] = field(default_factory=dict)
+    capture_events: dict[str, dict[torch.device, torch.Event]] = field(
+        default_factory=dict
+    )
 
     # Sum of token outer products; divide by token_count for Sigma_X (SIC).
     hessian: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -58,9 +143,17 @@ class OSFP4CalibrationCache:
 
     # Sampling state for routed experts whose final token counts are unknown.
     reservoirs: dict[str, ActivationReservoir] = field(default_factory=dict)
+    reservoir_queues: dict[torch.device, _ReservoirCaptureQueue] = field(
+        default_factory=dict
+    )
 
     def clear_all(self) -> None:
         """Clear all cached calibration data and capture streams."""
+        for mapping_name in list(self.capture_events):
+            self.wait_for_capture(mapping_name, torch.device("cpu"))
+        for queue in self.reservoir_queues.values():
+            queue.drain()
+        self.reservoir_queues.clear()
         self.reservoirs.clear()
         self.cached_activations.clear()
         self.capture_events.clear()
@@ -108,7 +201,9 @@ class OSFP4CalibrationCache:
                 "expected tokens and activation sample size must be positive"
             )
 
-        def capture_calibration_batch_hook(layer: Linear, args: tuple[torch.Tensor, ...]) -> None:
+        def capture_calibration_batch_hook(
+            layer: Linear, args: tuple[torch.Tensor, ...]
+        ) -> None:
             """Count tokens and capture calibration data from one input batch.
 
             Accumulate statistics from all rows and cache selected activations
@@ -120,7 +215,9 @@ class OSFP4CalibrationCache:
             if activation_rows.shape[0] == 0:
                 return
             batch_token_offset = self.token_count.get(mapping_name, 0)
-            self.token_count[mapping_name] = batch_token_offset + activation_rows.shape[0]
+            self.token_count[mapping_name] = (
+                batch_token_offset + activation_rows.shape[0]
+            )
             batch_sampled_indices = None
             reservoir_slots = None
             if reservoir_sampling:
@@ -131,6 +228,11 @@ class OSFP4CalibrationCache:
                 reservoir = self.reservoirs[mapping_name]
                 reservoir_slots, batch_sampled_indices = reservoir.select_batch(
                     batch_token_offset, activation_rows.shape[0]
+                )
+                self._update_reservoir_indices(
+                    mapping_name,
+                    reservoir_slots,
+                    batch_sampled_indices + batch_token_offset,
                 )
             elif subsample_during_capture:
                 batch_sampled_indices = self._get_batch_sampled_indices(
@@ -149,7 +251,22 @@ class OSFP4CalibrationCache:
                 batch_sampled_indices is None or num_rows_to_cache > 0
             )
 
-            if activation_rows.device.type == "cuda":
+            if (
+                activation_rows.device.type == "cuda"
+                and reservoir_sampling
+                and retain_activations
+            ):
+                self._capture_reservoir_batch_cuda(
+                    mapping_name,
+                    layer,
+                    activations,
+                    activation_rows,
+                    batch_sampled_indices,
+                    reservoir_slots,
+                    optimization_mode=optimization_mode,
+                )
+                cached_batch = None
+            elif activation_rows.device.type == "cuda":
                 cached_batch = self._capture_calibration_batch_cuda(
                     mapping_name,
                     layer,
@@ -185,7 +302,10 @@ class OSFP4CalibrationCache:
             if cached_batch is not None:
                 if reservoir_sampling:
                     self._update_activation_reservoir(
-                        mapping_name, reservoir_slots, cached_batch
+                        mapping_name,
+                        reservoir_slots,
+                        cached_batch,
+                        len(self.reservoirs[mapping_name].indices),
                     )
                 else:
                     self.cached_activations.setdefault(mapping_name, []).append(
@@ -194,14 +314,31 @@ class OSFP4CalibrationCache:
 
         return capture_calibration_batch_hook
 
+    def _update_reservoir_indices(
+        self,
+        mapping_name: str,
+        slots: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> None:
+        """Update replaced slots while retaining the fixed index allocation."""
+        reservoir = self.reservoirs[mapping_name]
+        previous = self.sampled_indices.get(mapping_name)
+        buffer = (
+            torch.empty(reservoir.cap, dtype=torch.int64)
+            if previous is None
+            else previous.as_strided((reservoir.cap,), (1,))
+        )
+        buffer.index_copy_(0, slots, indices)
+        self.sampled_indices[mapping_name] = buffer[: len(reservoir.indices)]
+
     def _update_activation_reservoir(
         self,
         mapping_name: str,
         slots: torch.Tensor,
         selected_activations: torch.Tensor,
+        populated_length: int,
     ) -> None:
-        """Replace reservoir slots after their selected rows have reached the CPU."""
-        self.wait_for_capture(mapping_name, torch.device("cpu"))
+        """Commit CPU-ready rows using the populated length from their capture."""
         reservoir = self.reservoirs[mapping_name]
         batches = self.cached_activations.get(mapping_name)
         if batches is None:
@@ -220,10 +357,79 @@ class OSFP4CalibrationCache:
                 (reservoir.cap, buffer.shape[1]), buffer.stride()
             )
         buffer.index_copy_(0, slots, selected_activations)
-        self.cached_activations[mapping_name] = [buffer[: len(reservoir.indices)]]
-        self.sampled_indices[mapping_name] = torch.tensor(
-            reservoir.indices, dtype=torch.int64
+        self.cached_activations[mapping_name] = [buffer[:populated_length]]
+
+    def _commit_reservoir_capture(self, entry: _PendingReservoirCapture) -> None:
+        self._update_activation_reservoir(
+            entry.mapping_name,
+            entry.slots,
+            entry.rows,
+            entry.populated_length,
         )
+
+    def _capture_reservoir_batch_cuda(
+        self,
+        mapping_name: str,
+        layer: Linear,
+        activations: torch.Tensor,
+        activation_rows: torch.Tensor,
+        batch_sampled_indices: torch.Tensor,
+        slots: torch.Tensor,
+        *,
+        optimization_mode: Literal["rtn", "sic"],
+    ) -> None:
+        """Queue bounded staging copies without waiting inside every expert hook."""
+        device = activation_rows.device
+        queue = self.reservoir_queues.get(device)
+        if queue is None:
+            queue = _ReservoirCaptureQueue(self._commit_reservoir_capture)
+            self.reservoir_queues[device] = queue
+        shape = (batch_sampled_indices.numel(), activation_rows.shape[1])
+        numel = shape[0] * shape[1]
+        buffer = queue.acquire(numel, activation_rows.dtype)
+        staging = None if buffer is None else buffer[:numel].view(shape)
+        try:
+            rows = self._capture_calibration_batch_cuda(
+                mapping_name,
+                layer,
+                activations,
+                activation_rows,
+                batch_sampled_indices,
+                retain_activations=True,
+                optimization_mode=optimization_mode,
+                subsample_during_capture=True,
+                staging_buffer=staging,
+                non_blocking_indices=True,
+            )
+        except BaseException:
+            # A failed capture may have enqueued a copy before failing to publish
+            # its completion event. Do not recycle its staging memory until safe.
+            stream = self.capture_streams.get(device)
+            if stream is not None:
+                stream.synchronize()
+            if buffer is not None:
+                queue.pool.append(buffer)
+            raise
+        event = self.capture_events[mapping_name][device]
+        populated_length = len(self.reservoirs[mapping_name].indices)
+        if buffer is None:
+            # Oversized copies use a temporary allocation after all earlier commits.
+            event.synchronize()
+            self._update_activation_reservoir(
+                mapping_name, slots, rows, populated_length
+            )
+        else:
+            queue.pending.append(
+                _PendingReservoirCapture(
+                    mapping_name,
+                    slots,
+                    populated_length,
+                    buffer,
+                    rows,
+                    event,
+                    batch_sampled_indices,
+                )
+            )
 
     def _get_batch_sampled_indices(
         self,
@@ -251,7 +457,9 @@ class OSFP4CalibrationCache:
         if sampled_indices.numel() < total_num_tokens:
             index_start, index_end = torch.searchsorted(
                 sampled_indices,
-                torch.tensor([batch_token_offset, batch_token_offset + activation_rows.shape[0]]),
+                torch.tensor(
+                    [batch_token_offset, batch_token_offset + activation_rows.shape[0]]
+                ),
             ).tolist()
             return sampled_indices[index_start:index_end] - batch_token_offset
         return None
@@ -284,7 +492,9 @@ class OSFP4CalibrationCache:
         else:
             sigma_x_squared_sum = activation_rows.float().square().sum(dim=0)
             if mapping_name not in self.sigma_x_squared_sum:
-                self.sigma_x_squared_sum[mapping_name] = torch.zeros_like(sigma_x_squared_sum)
+                self.sigma_x_squared_sum[mapping_name] = torch.zeros_like(
+                    sigma_x_squared_sum
+                )
             self.sigma_x_squared_sum[mapping_name].add_(sigma_x_squared_sum)
         if subsample_during_capture and activation_rows.shape[0]:
             input_channel_absmax = activation_rows.float().abs().amax(dim=0)
@@ -306,12 +516,16 @@ class OSFP4CalibrationCache:
         retain_activations: bool,
         optimization_mode: Literal["rtn", "sic"],
         subsample_during_capture: bool,
+        staging_buffer: torch.Tensor | None = None,
+        non_blocking_indices: bool = False,
     ) -> torch.Tensor | None:
         """Schedule statistics and optional activation copies on the capture stream."""
         device = activation_rows.device
         cached_batch = None
         if retain_activations:
-            if batch_sampled_indices is None:
+            if staging_buffer is not None:
+                cached_batch = staging_buffer
+            elif batch_sampled_indices is None:
                 cached_batch = torch.empty_like(
                     activation_rows, device="cpu", pin_memory=True
                 )
@@ -341,8 +555,15 @@ class OSFP4CalibrationCache:
             if cached_batch is not None:
                 selected_activations = activation_rows
                 if batch_sampled_indices is not None:
+                    # Queued capture retains the CPU source through completion.
+                    # Pageable staging may still cost host time, but requesting a
+                    # nonblocking upload avoids an explicit stream synchronization
+                    # after this batch's statistics kernels.
                     selected_activations = activation_rows.index_select(
-                        0, batch_sampled_indices.to(device)
+                        0,
+                        batch_sampled_indices.to(
+                            device, non_blocking=non_blocking_indices
+                        ),
                     )
                 cached_batch.copy_(selected_activations, non_blocking=True)
             capture_complete_event = cuda.Event()
@@ -373,6 +594,7 @@ class OSFP4CalibrationCache:
         """Check token and retained-row counts match the streaming sampling plan."""
         if mapping_name not in self.sampled_indices:
             return
+        self.wait_for_capture(mapping_name, torch.device("cpu"))
         token_count = self.token_count.get(mapping_name, 0)
         reservoir = self.reservoirs.get(mapping_name)
         total_num_tokens = (
@@ -386,7 +608,8 @@ class OSFP4CalibrationCache:
             raise ValueError(f"OSFP4 {mapping_name}: incorrect reservoir size")
         if token_count != total_num_tokens:
             raise ValueError(
-                f"OSFP4 {mapping_name}: expected {total_num_tokens} calibration tokens, got {token_count}"
+                f"OSFP4 {mapping_name}: expected {total_num_tokens} "
+                f"calibration tokens, got {token_count}"
             )
         num_cached_tokens = sum(
             len(batch) for batch in self.cached_activations.get(mapping_name, ())
@@ -396,7 +619,9 @@ class OSFP4CalibrationCache:
                 f"OSFP4 {mapping_name}: incorrect retained activation count"
             )
 
-    def prepare_sampled_activations(self, mapping_name: str, output_rows: int) -> ActivationSubsample:
+    def prepare_sampled_activations(
+        self, mapping_name: str, output_rows: int
+    ) -> ActivationSubsample:
         """Wait, validate, and combine already sampled rows for optimization.
 
         Return sampling metadata alongside the rows in token order. Known-count
@@ -442,6 +667,9 @@ class OSFP4CalibrationCache:
     def wait_for_capture(self, mapping_name: str, device: torch.device) -> None:
         """Wait for outstanding capture events on the consuming device."""
         capture_events = self.capture_events.get(mapping_name, {}).values()
+        # Optimization on either device also reads the CPU activation cache.
+        for queue in self.reservoir_queues.values():
+            queue.drain(mapping_name)
         if device.type == "cuda":
             consumer_stream = torch.get_device_module(device).current_stream(device)
             for capture_event in capture_events:
@@ -452,6 +680,7 @@ class OSFP4CalibrationCache:
 
     def clear_mapping(self, mapping_name: str) -> None:
         """Clear cached calibration data for one mapping."""
+        self.wait_for_capture(mapping_name, torch.device("cpu"))
         self.reservoirs.pop(mapping_name, None)
         self.cached_activations.pop(mapping_name, None)
         self.capture_events.pop(mapping_name, None)

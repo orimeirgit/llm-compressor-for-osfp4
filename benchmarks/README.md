@@ -1,5 +1,15 @@
 # Benchmarks
 
+## OSFP4 routed activation capture
+
+[`bench_osfp4_capture.py`](bench_osfp4_capture.py) replays synthetic routed expert
+inputs through the actual OSFP4 calibration cache. It measures cold and filled
+reservoirs, RTN/SIC, optional Hessian offloading, and CPU/CUDA memory. Optional
+profiler runs export Chrome traces with sampling, statistics, transfer scheduling,
+wait, and reservoir-commit ranges. See [the protocol](osfp4_capture.md) for
+baseline comparison and the separate full-layer verification required before
+claiming a calibration speedup.
+
 ## Subgraph tracing
 
 [`bench_trace_subgraphs.py`](bench_trace_subgraphs.py) measures the end-to-end
