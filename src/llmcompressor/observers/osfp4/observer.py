@@ -24,6 +24,7 @@ from .scale_optimization import (
     materialize_scale_values,
     run_chunked_optimizer,
     select_blocks_per_chunk,
+    uses_exact_alpha_reduction,
 )
 from .scale_selection import (
     _search_e4m3_gamma_star,
@@ -59,6 +60,7 @@ def _optimize_joint_scales(
     )
     L, m, _ = W_blocks.shape
     blocks_per_chunk = select_blocks_per_chunk(m, X_blocks.shape[2], L)
+    exact_alpha_reduction = uses_exact_alpha_reduction(m, X_blocks.shape[2], L)
     initial_scales = initialize_scale_values_from_absmax(
         W_blocks, X_blocks, blocks_per_chunk=blocks_per_chunk
     )
@@ -81,6 +83,7 @@ def _optimize_joint_scales(
             JointLossCoefficients(
                 coefficients.coeff_w[blocks], coefficients.coeff_x[blocks]
             ),
+            exact_alpha_reduction=exact_alpha_reduction,
         ).sum()
 
     run_chunked_optimizer(
@@ -110,6 +113,7 @@ def _optimize_weight_scales(
     )
     L, m, _ = W_blocks.shape
     blocks_per_chunk = select_blocks_per_chunk(m, 0, L)
+    exact_alpha_reduction = uses_exact_alpha_reduction(m, 0, L)
     initial_scales = initialize_scale_values_from_absmax(
         W_blocks, None, blocks_per_chunk=blocks_per_chunk
     )
@@ -127,6 +131,7 @@ def _optimize_weight_scales(
             chunk_log_scales.log_alpha.exp(),
             chunk_log_scales.log_gamma_w.exp(),
             coefficients[blocks],
+            exact_alpha_reduction=exact_alpha_reduction,
         ).sum()
 
     run_chunked_optimizer(

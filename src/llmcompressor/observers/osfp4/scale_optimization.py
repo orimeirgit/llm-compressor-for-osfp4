@@ -17,6 +17,7 @@ __all__ = [
     "run_optimizer",
     "run_chunked_optimizer",
     "select_blocks_per_chunk",
+    "uses_exact_alpha_reduction",
 ]
 
 _FP8_MAX = 448.0
@@ -195,9 +196,28 @@ def select_blocks_per_chunk(m: int, k: int, num_blocks: int) -> int:
     the blocks, their loss coefficients, and the workspace. Problems whose whole
     graph fits within ``_MIN_SPLIT_BYTES`` are not split.
 
-    The result depends only on the shape, never on free device memory, because
-    CUDA reductions over chunks are not bitwise identical across chunk sizes.
+    The result depends only on the shape, never on free device memory. Every
+    problem that may be split uses ``uses_exact_alpha_reduction``, so optimized
+    scales do not depend on the chunk size.
     """
+    if not _exceeds_split_threshold(m, k, num_blocks):
+        return num_blocks
+    return max(1, num_blocks // _GRAPH_COPIES)
+
+
+def uses_exact_alpha_reduction(m: int, k: int, num_blocks: int) -> bool:
+    """Return whether alpha's gradient must be reduced in FP64 for this shape.
+
+    True for exactly the problems ``select_blocks_per_chunk`` may split. Their
+    FP32 reduction order would depend on the chunk size; FP64 accumulation makes
+    chunked and whole-tensor optimization agree bit for bit. Smaller problems are
+    never chunked and keep the original FP32 arithmetic (and reference fixtures).
+    """
+    return _exceeds_split_threshold(m, k, num_blocks)
+
+
+def _exceeds_split_threshold(m: int, k: int, num_blocks: int) -> bool:
+    """Whether one whole-problem autograd graph exceeds ``_MIN_SPLIT_BYTES``."""
     full_graph_bytes = (
         _GRAPH_COPIES
         * num_blocks
@@ -206,9 +226,7 @@ def select_blocks_per_chunk(m: int, k: int, num_blocks: int) -> int:
         * torch.finfo(torch.float32).bits
         // 8
     )
-    if full_graph_bytes <= _MIN_SPLIT_BYTES:
-        return num_blocks
-    return max(1, num_blocks // _GRAPH_COPIES)
+    return full_graph_bytes > _MIN_SPLIT_BYTES
 
 
 def run_chunked_optimizer(

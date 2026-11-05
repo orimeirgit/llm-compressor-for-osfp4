@@ -14,12 +14,14 @@ from llmcompressor.observers.osfp4.loss import (
     compute_joint_loss,
     compute_weight_loss,
 )
+from llmcompressor.observers.osfp4.lut import phi_lut
 from llmcompressor.observers.osfp4.scale_optimization import (
     create_log_scale_parameters,
     initialize_scale_values_from_absmax,
     run_chunked_optimizer,
     run_optimizer,
     select_blocks_per_chunk,
+    uses_exact_alpha_reduction,
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -48,7 +50,7 @@ def make_blocks(L=7, m=5, k=11, device="cpu"):
     return W.to(device), X.to(device), metric.to(device)
 
 
-def optimize(W, X, metric, *, steps, blocks_per_chunk):
+def optimize(W, X, metric, *, steps, blocks_per_chunk, exact=False):
     """Run Adam with the whole-tensor runner (None) or the chunked runner."""
     L = W.shape[0]
     initial = initialize_scale_values_from_absmax(
@@ -67,6 +69,7 @@ def optimize(W, X, metric, *, steps, blocks_per_chunk):
                 scales.log_alpha.exp(),
                 scales.log_gamma_w.exp(),
                 coefficients[blocks],
+                exact_alpha_reduction=exact,
             ).sum()
         return compute_joint_loss(
             W[blocks],
@@ -77,6 +80,7 @@ def optimize(W, X, metric, *, steps, blocks_per_chunk):
             JointLossCoefficients(
                 coefficients.coeff_w[blocks], coefficients.coeff_x[blocks]
             ),
+            exact_alpha_reduction=exact,
         ).sum()
 
     if blocks_per_chunk is None:
@@ -193,16 +197,67 @@ def test_blocks_per_chunk_depends_only_on_shape():
 
 
 @CUDA
-def test_chunked_adam_is_deterministic_and_close_to_whole_tensor_on_cuda():
-    W, X, metric = make_blocks(L=64, m=512, k=1024, device="cuda")
+@pytest.mark.parametrize("weight_only", [False, True])
+@pytest.mark.parametrize("blocks_per_chunk", [3, 4, 31])
+def test_chunked_adam_matches_whole_tensor_bytes_on_cuda(weight_only, blocks_per_chunk):
+    # m = 1536 makes CUDA choose a different FP32 reduction order for 4 and 32
+    # blocks, so this shape fails if alpha's gradient is summed in FP32.
+    W, X, metric = make_blocks(L=32, m=1536, k=512, device="cuda")
+    X = None if weight_only else X
 
-    expected = optimize(W, X, metric, steps=3, blocks_per_chunk=None)
-    first = optimize(W, X, metric, steps=3, blocks_per_chunk=8)
-    second = optimize(W, X, metric, steps=3, blocks_per_chunk=8)
+    def run(chunk):
+        return optimize(W, X, metric, steps=3, blocks_per_chunk=chunk, exact=True)
+
+    expected = run(None)
+    first = run(blocks_per_chunk)
+    second = run(blocks_per_chunk)
 
     for a, b, e in zip(first, second, expected):
         assert_bytes(a, b)
-        torch.testing.assert_close(a, e, rtol=1e-3, atol=1e-3)
+        assert_bytes(a, e)
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=CUDA)],
+)
+def test_alpha_gradient_is_correctly_rounded_and_chunk_invariant(device):
+    W, X, metric = make_blocks(L=8, m=1536, k=512, device=device)
+    coefficients = build_joint_loss_coefficients(W, X, weight_metric=metric)
+    initial = initialize_scale_values_from_absmax(W, X)
+    rows, samples = W.shape[1], X.shape[2]
+
+    def alpha_gradient(blocks):
+        alpha = initial.alpha[blocks].clone().requires_grad_(True)
+        total = compute_joint_loss(
+            W[blocks],
+            X[blocks],
+            alpha,
+            initial.gamma_w[blocks],
+            initial.gamma_x[blocks],
+            JointLossCoefficients(
+                coefficients.coeff_w[blocks], coefficients.coeff_x[blocks]
+            ),
+            exact_alpha_reduction=True,
+        ).sum()
+        return torch.autograd.grad(total, alpha)[0]
+
+    def reference_alpha_gradient():
+        # Independent formula: expanding alpha in FP64 makes autograd sum the same
+        # FP32 terms in FP64 and round each of the two sums once.
+        alpha = initial.alpha.clone().requires_grad_(True)
+        alpha_w = alpha.double().unsqueeze(1).expand(-1, rows, -1).float()
+        alpha_x = alpha.double().unsqueeze(2).expand(-1, -1, samples).float()
+        phi_w = phi_lut(W / (alpha_w * initial.gamma_w))
+        loss_w = (coefficients.coeff_w * phi_w).sum(dim=(1, 2)) / rows
+        phi_x = phi_lut(alpha_x * X / initial.gamma_x)
+        loss_x = (coefficients.coeff_x * phi_x).sum(dim=(1, 2)) / (rows * samples)
+        return torch.autograd.grad((loss_w + loss_x).sum(), alpha)[0]
+
+    whole = alpha_gradient(slice(None))
+    chunks = [alpha_gradient(slice(start, start + 3)) for start in (0, 3, 6)]
+    assert_bytes(torch.cat(chunks), whole)
+    assert_bytes(whole, reference_alpha_gradient())
 
 
 @CUDA
@@ -225,3 +280,46 @@ def test_joint_scale_optimization_peak_memory_is_about_three_copies():
     # W_blocks and X_blocks already exist (copy 1); coefficients add copy 2 and the
     # chunk graph about one more.
     assert peak_extra <= 2.5 * block_bytes, peak_extra / block_bytes
+
+
+def test_exact_alpha_reduction_covers_every_problem_that_may_be_split():
+    # Every problem select_blocks_per_chunk may split uses the FP64 reduction, so
+    # chunking never changes results; smaller problems keep the FP32 reference.
+    shapes = [(m, k, L) for m in (5, 512, 1536, 4096, 6144, 28672)
+              for k in (0, 11, 512, 8192, 28672) for L in (1, 7, 32, 256, 896)]
+    for m, k, L in shapes:
+        if select_blocks_per_chunk(m, k, L) < L:
+            assert uses_exact_alpha_reduction(m, k, L), (m, k, L)
+    # Golden-fixture and unit-test shapes stay on the original arithmetic.
+    assert not uses_exact_alpha_reduction(m=5, k=11, num_blocks=7)
+    assert not uses_exact_alpha_reduction(m=128, k=64, num_blocks=4)
+    # All Llama-3.1-8B mappings, both modes, take the exact path.
+    for m, n, k in [(6144, 4096, 8192), (4096, 4096, 8192), (28672, 4096, 8192),
+                    (4096, 14336, 28672)]:
+        assert uses_exact_alpha_reduction(m, k, n // 16)
+        assert uses_exact_alpha_reduction(m, 0, n // 16)
+
+
+@pytest.mark.parametrize("weight_only", [False, True])
+@pytest.mark.parametrize("exact", [False, True])
+def test_observer_passes_shape_gate_to_loss(monkeypatch, weight_only, exact):
+    W, X, metric = make_blocks()
+    seen = []
+    name = "compute_weight_loss" if weight_only else "compute_joint_loss"
+    original = getattr(osfp4_observer, name)
+
+    def recording(*args, exact_alpha_reduction, **kwargs):
+        seen.append(exact_alpha_reduction)
+        return original(*args, exact_alpha_reduction=exact_alpha_reduction, **kwargs)
+
+    monkeypatch.setattr(osfp4_observer, name, recording)
+    monkeypatch.setattr(
+        osfp4_observer, "uses_exact_alpha_reduction", lambda m, k, num_blocks: exact
+    )
+    if weight_only:
+        osfp4_observer._optimize_weight_scales(W, metric, steps=2, lr=0.12)
+    else:
+        osfp4_observer._optimize_joint_scales(
+            W, X, weight_metric=metric, steps=2, lr=0.12
+        )
+    assert seen and all(flag is exact for flag in seen)
