@@ -1,0 +1,23 @@
+{
+  "protocol": "olmo3-selected9-v1",
+  "model": "allenai/Olmo-3-7B-Instruct",
+  "revision": "6e5971d9eba42665f5bd5a0fcf047f299ce1dccc",
+  "notes": [
+    "Rebuilt from RUN_GUIDE.md (benchmarks, batch sizes, caps, sampling); the original benchmark_protocol.json was not available, so task variants and few-shot counts below are choices recorded here, not copied from the Mistral run.",
+    "Every generative task stops on <|im_end|> and <|endoftext|>: Olmo-3 ends chat turns with <|im_end|> while tokenizer.eos_token is <|endoftext|>.",
+    "Chat-templated tasks use the model's own template, which injects its default system prompt when none is given."
+  ],
+  "order": ["mmlu_cot", "gsm8k", "hellaswag", "winogrande", "arc_challenge", "gpqa_diamond", "aime2025", "ifbench"],
+  "gpqa_choice_order_seed": 1234,
+  "tasks": {
+    "mmlu_cot": {"runner": "lmeval", "lmeval_task": "mmlu_cot_llama", "metric": "exact_match,strict_match", "batch_size": 16, "chat": true, "num_fewshot": 0, "max_gen_toks": 1024},
+    "gsm8k": {"runner": "lmeval", "lmeval_task": "gsm8k_cot_llama", "metric": "exact_match,strict-match", "batch_size": 16, "chat": true, "fewshot_as_multiturn": true, "num_fewshot": 8, "max_gen_toks": 1024},
+    "hellaswag": {"runner": "lmeval", "lmeval_task": "hellaswag", "metric": "acc_norm,none", "batch_size": 4, "chat": false, "num_fewshot": 0},
+    "winogrande": {"runner": "lmeval", "lmeval_task": "winogrande", "metric": "acc,none", "batch_size": 4, "chat": false, "num_fewshot": 0},
+    "arc_challenge": {"runner": "lmeval", "lmeval_task": "arc_challenge", "metric": "acc_norm,none", "batch_size": 4, "chat": false, "num_fewshot": 0},
+    "gpqa_diamond": {"runner": "generate", "batch_size": 8, "do_sample": true, "temperature": 1.0, "top_p": 0.95, "top_k": 64, "max_new_tokens": 8192, "seeds": [0, 1, 2], "metric": "LightEval gpqa_instruct_pass@1, mean over seeds"},
+    "aime2025": {"runner": "generate", "batch_size": 8, "do_sample": true, "temperature": 1.0, "top_p": 0.95, "top_k": 64, "max_new_tokens": 8192, "seeds": [0, 1, 2, 3, 4, 5, 6, 7], "metric": "LightEval math pass@1, mean over seeds"},
+    "ifbench": {"runner": "generate", "batch_size": 8, "do_sample": false, "max_new_tokens": 8192, "seeds": [0], "metric": "official IFBench prompt-level loose accuracy (all four reported)"},
+    "wikitext2": {"runner": "wikitext", "batch_size": 1, "dataset": "wikitext-2-raw-v1/test", "seq_len": 2048, "stride": 2048, "metric": "token perplexity"}
+  }
+}
