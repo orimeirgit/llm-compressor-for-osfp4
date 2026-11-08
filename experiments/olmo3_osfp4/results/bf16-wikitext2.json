@@ -1,0 +1,10 @@
+{
+  "task": "wikitext2",
+  "perplexity": 14.006394255307663,
+  "windows": 141,
+  "tokens_scored": 288627,
+  "seq_len": 2048,
+  "model_path": "/workspace/osfp4-cache/hub/models--allenai--Olmo-3-7B-Instruct/snapshots/6e5971d9eba42665f5bd5a0fcf047f299ce1dccc",
+  "transforms_loaded": 0,
+  "limit_windows": null
+}

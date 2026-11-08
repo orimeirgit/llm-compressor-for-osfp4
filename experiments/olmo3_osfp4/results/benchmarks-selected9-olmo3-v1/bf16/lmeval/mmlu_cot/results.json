@@ -1,0 +1,21 @@
+{
+  "task": "mmlu_cot",
+  "lmeval_task": "mmlu_cot_llama",
+  "metric": "exact_match,strict_match",
+  "score": 0.6621563879789204,
+  "gen_kwargs": "until=<|im_end|>,max_gen_toks=1024,do_sample=False",
+  "model_path": "/workspace/osfp4-cache/hub/models--allenai--Olmo-3-7B-Instruct/snapshots/6e5971d9eba42665f5bd5a0fcf047f299ce1dccc",
+  "transforms_loaded": 0,
+  "limit": null,
+  "n_samples": 14042,
+  "config": {
+    "runner": "lmeval",
+    "lmeval_task": "mmlu_cot_llama",
+    "metric": "exact_match,strict_match",
+    "batch_size": 16,
+    "chat": true,
+    "num_fewshot": 0,
+    "max_gen_toks": 1024
+  },
+  "cap_hits": 206
+}

@@ -1,0 +1,474 @@
+{
+  "fold_equivalence_fp64": {
+    "default_mapping: post_attention_layernorm -> gate/up (what the registry falls back to)": {
+      "relative_logit_error": 0.4919567198586039,
+      "exact": false
+    },
+    "post_feedforward_layernorm(i) -> q/k/v(i+1) (looks plausible, also wrong)": {
+      "relative_logit_error": 0.487531646918286,
+      "exact": false
+    },
+    "v_proj -> o_proj fold": {
+      "relative_logit_error": 0.0,
+      "exact": true
+    },
+    "up_proj -> down_proj fold": {
+      "relative_logit_error": 0.0,
+      "exact": true
+    },
+    "runtime input transform on q,k,v,gate,up,o,down (fixed branch)": {
+      "relative_logit_error": 0.0,
+      "exact": true
+    }
+  },
+  "activation_stats": {
+    "layers.0.q_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.04595884308218956,
+      "absmax_excl_first_token": 2.84375,
+      "absmax_incl_first_token": 2.84375,
+      "top_channel_absmax": [
+        2.84375,
+        2.453125,
+        1.15625
+      ],
+      "channel_absmax_max_over_median": 6.558558464050293,
+      "channel_rms_max_over_median": 7.247529029846191,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.011322272941470146
+    },
+    "layers.0.o_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.05880272760987282,
+      "absmax_excl_first_token": 4.40625,
+      "absmax_incl_first_token": 4.40625,
+      "top_channel_absmax": [
+        4.40625,
+        4.03125,
+        2.671875
+      ],
+      "channel_absmax_max_over_median": 33.6716423034668,
+      "channel_rms_max_over_median": 128.6838836669922,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.703697681427002
+    },
+    "layers.0.gate_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.05058000609278679,
+      "absmax_excl_first_token": 2.859375,
+      "absmax_incl_first_token": 2.859375,
+      "top_channel_absmax": [
+        2.859375,
+        2.28125,
+        2.234375
+      ],
+      "channel_absmax_max_over_median": 6.5650224685668945,
+      "channel_rms_max_over_median": 19.575599670410156,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.012808677740395069
+    },
+    "layers.0.down_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.009398995898663998,
+      "absmax_excl_first_token": 3.8125,
+      "absmax_incl_first_token": 3.8125,
+      "top_channel_absmax": [
+        3.8125,
+        3.28125,
+        3.265625
+      ],
+      "channel_absmax_max_over_median": 17.99078369140625,
+      "channel_rms_max_over_median": 16.80652618408203,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.004405403509736061,
+      "sic_damp_over_median_diag": 0.014641267247498035
+    },
+    "layers.1.q_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.052990250289440155,
+      "absmax_excl_first_token": 2.984375,
+      "absmax_incl_first_token": 2.984375,
+      "top_channel_absmax": [
+        2.984375,
+        2.671875,
+        2.609375
+      ],
+      "channel_absmax_max_over_median": 6.9454545974731445,
+      "channel_rms_max_over_median": 24.07809829711914,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.013307355344295502
+    },
+    "layers.1.o_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.03746519237756729,
+      "absmax_excl_first_token": 4.21875,
+      "absmax_incl_first_token": 4.21875,
+      "top_channel_absmax": [
+        4.21875,
+        3.921875,
+        3.859375
+      ],
+      "channel_absmax_max_over_median": 10.536585807800293,
+      "channel_rms_max_over_median": 20.776742935180664,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.019125506281852722
+    },
+    "layers.1.gate_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.055966123938560486,
+      "absmax_excl_first_token": 3.015625,
+      "absmax_incl_first_token": 3.015625,
+      "top_channel_absmax": [
+        3.015625,
+        2.984375,
+        2.953125
+      ],
+      "channel_absmax_max_over_median": 6.862222194671631,
+      "channel_rms_max_over_median": 26.138519287109375,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.013342301361262798
+    },
+    "layers.1.down_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.0070124901831150055,
+      "absmax_excl_first_token": 4.09375,
+      "absmax_incl_first_token": 4.09375,
+      "top_channel_absmax": [
+        4.09375,
+        3.15625,
+        2.140625
+      ],
+      "channel_absmax_max_over_median": 20.85572052001953,
+      "channel_rms_max_over_median": 20.89641761779785,
+      "fp8_block_scale_underflow_frac": 0.008352570235729218,
+      "fp8_block_scale_subnormal_frac": 0.027148157358169556,
+      "sic_damp_over_median_diag": 0.012932469137012959
+    },
+    "layers.4.q_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.07336380332708359,
+      "absmax_excl_first_token": 3.71875,
+      "absmax_incl_first_token": 3.71875,
+      "top_channel_absmax": [
+        3.71875,
+        3.46875,
+        2.953125
+      ],
+      "channel_absmax_max_over_median": 8.314410209655762,
+      "channel_rms_max_over_median": 29.65259552001953,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.013836456462740898
+    },
+    "layers.4.o_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.034053754061460495,
+      "absmax_excl_first_token": 3.46875,
+      "absmax_incl_first_token": 3.46875,
+      "top_channel_absmax": [
+        3.46875,
+        2.921875,
+        2.421875
+      ],
+      "channel_absmax_max_over_median": 9.202072143554688,
+      "channel_rms_max_over_median": 11.24778938293457,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.016749832779169083
+    },
+    "layers.4.gate_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.07728731632232666,
+      "absmax_excl_first_token": 3.859375,
+      "absmax_incl_first_token": 3.859375,
+      "top_channel_absmax": [
+        3.859375,
+        3.640625,
+        2.9375
+      ],
+      "channel_absmax_max_over_median": 8.372880935668945,
+      "channel_rms_max_over_median": 28.815698623657227,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.01368048693984747
+    },
+    "layers.4.down_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.008854676969349384,
+      "absmax_excl_first_token": 4.4375,
+      "absmax_incl_first_token": 4.4375,
+      "top_channel_absmax": [
+        4.4375,
+        3.265625,
+        3.15625
+      ],
+      "channel_absmax_max_over_median": 19.84279441833496,
+      "channel_rms_max_over_median": 22.103679656982422,
+      "fp8_block_scale_underflow_frac": 0.0025659676175564528,
+      "fp8_block_scale_subnormal_frac": 0.005658397916704416,
+      "sic_damp_over_median_diag": 0.013617944903671741
+    },
+    "layers.8.q_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.12244125455617905,
+      "absmax_excl_first_token": 5.71875,
+      "absmax_incl_first_token": 5.71875,
+      "top_channel_absmax": [
+        5.71875,
+        4.71875,
+        4.03125
+      ],
+      "channel_absmax_max_over_median": 10.237762451171875,
+      "channel_rms_max_over_median": 36.53761672973633,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.015178279019892216
+    },
+    "layers.8.o_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.08272536844015121,
+      "absmax_excl_first_token": 4.96875,
+      "absmax_incl_first_token": 4.96875,
+      "top_channel_absmax": [
+        4.96875,
+        4.5,
+        4.125
+      ],
+      "channel_absmax_max_over_median": 8.895105361938477,
+      "channel_rms_max_over_median": 9.622355461120605,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.01532358955591917
+    },
+    "layers.8.gate_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.12727124989032745,
+      "absmax_excl_first_token": 6.1875,
+      "absmax_incl_first_token": 6.1875,
+      "top_channel_absmax": [
+        6.1875,
+        4.9375,
+        4.0
+      ],
+      "channel_absmax_max_over_median": 10.924138069152832,
+      "channel_rms_max_over_median": 36.340999603271484,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.015152549371123314
+    },
+    "layers.8.down_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.022675294429063797,
+      "absmax_excl_first_token": 5.125,
+      "absmax_incl_first_token": 5.125,
+      "top_channel_absmax": [
+        5.125,
+        4.96875,
+        4.625
+      ],
+      "channel_absmax_max_over_median": 11.714285850524902,
+      "channel_rms_max_over_median": 16.177724838256836,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 4.8516321839997545e-06,
+      "sic_damp_over_median_diag": 0.012350074015557766
+    },
+    "layers.16.q_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.2513229250907898,
+      "absmax_excl_first_token": 13.75,
+      "absmax_incl_first_token": 13.75,
+      "top_channel_absmax": [
+        13.75,
+        11.1875,
+        9.9375
+      ],
+      "channel_absmax_max_over_median": 14.426229476928711,
+      "channel_rms_max_over_median": 36.45305633544922,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.015656864270567894
+    },
+    "layers.16.o_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.14628851413726807,
+      "absmax_excl_first_token": 5.5,
+      "absmax_incl_first_token": 5.5,
+      "top_channel_absmax": [
+        5.5,
+        5.0625,
+        4.875
+      ],
+      "channel_absmax_max_over_median": 4.957746505737305,
+      "channel_rms_max_over_median": 7.235568523406982,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.014970271848142147
+    },
+    "layers.16.gate_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.2681025266647339,
+      "absmax_excl_first_token": 14.5625,
+      "absmax_incl_first_token": 14.5625,
+      "top_channel_absmax": [
+        14.5625,
+        11.1875,
+        10.0625
+      ],
+      "channel_absmax_max_over_median": 14.5625,
+      "channel_rms_max_over_median": 35.444854736328125,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.01549611147493124
+    },
+    "layers.16.down_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.09407450258731842,
+      "absmax_excl_first_token": 15.6875,
+      "absmax_incl_first_token": 15.6875,
+      "top_channel_absmax": [
+        15.6875,
+        15.25,
+        15.1875
+      ],
+      "channel_absmax_max_over_median": 9.561904907226562,
+      "channel_rms_max_over_median": 11.174317359924316,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0003773357020691037,
+      "sic_damp_over_median_diag": 0.01350058987736702
+    },
+    "layers.24.q_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.5718831419944763,
+      "absmax_excl_first_token": 26.25,
+      "absmax_incl_first_token": 26.25,
+      "top_channel_absmax": [
+        26.25,
+        22.0,
+        12.3125
+      ],
+      "channel_absmax_max_over_median": 12.0,
+      "channel_rms_max_over_median": 19.50484275817871,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.012955933809280396
+    },
+    "layers.24.o_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.14790748059749603,
+      "absmax_excl_first_token": 11.3125,
+      "absmax_incl_first_token": 11.3125,
+      "top_channel_absmax": [
+        11.3125,
+        11.125,
+        9.375
+      ],
+      "channel_absmax_max_over_median": 5.838709831237793,
+      "channel_rms_max_over_median": 18.62298011779785,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.01955239661037922
+    },
+    "layers.24.gate_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.5834060907363892,
+      "absmax_excl_first_token": 26.125,
+      "absmax_incl_first_token": 26.125,
+      "top_channel_absmax": [
+        26.125,
+        22.125,
+        12.8125
+      ],
+      "channel_absmax_max_over_median": 11.77464771270752,
+      "channel_rms_max_over_median": 19.111614227294922,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.012935427017509937
+    },
+    "layers.24.down_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.39904913306236267,
+      "absmax_excl_first_token": 87.5,
+      "absmax_incl_first_token": 87.5,
+      "top_channel_absmax": [
+        87.5,
+        85.5,
+        69.5
+      ],
+      "channel_absmax_max_over_median": 12.727272987365723,
+      "channel_rms_max_over_median": 41.26169204711914,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.00025792489759624004,
+      "sic_damp_over_median_diag": 0.018049292266368866
+    },
+    "layers.31.q_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.953838050365448,
+      "absmax_excl_first_token": 75.5,
+      "absmax_incl_first_token": 75.5,
+      "top_channel_absmax": [
+        75.5,
+        45.5,
+        40.25
+      ],
+      "channel_absmax_max_over_median": 20.474576950073242,
+      "channel_rms_max_over_median": 10.374194145202637,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.013041934929788113
+    },
+    "layers.31.o_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.293570339679718,
+      "absmax_excl_first_token": 18.875,
+      "absmax_incl_first_token": 18.875,
+      "top_channel_absmax": [
+        18.875,
+        13.3125,
+        13.3125
+      ],
+      "channel_absmax_max_over_median": 6.070351600646973,
+      "channel_rms_max_over_median": 11.848983764648438,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.024745043367147446
+    },
+    "layers.31.gate_proj": {
+      "tokens": 23967,
+      "row_rms_median": 0.9758674502372742,
+      "absmax_excl_first_token": 93.5,
+      "absmax_incl_first_token": 93.5,
+      "top_channel_absmax": [
+        93.5,
+        56.5,
+        54.75
+      ],
+      "channel_absmax_max_over_median": 25.037656784057617,
+      "channel_rms_max_over_median": 10.030457496643066,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 0.0,
+      "sic_damp_over_median_diag": 0.013236087746918201
+    },
+    "layers.31.down_proj": {
+      "tokens": 23967,
+      "row_rms_median": 2.1820058822631836,
+      "absmax_excl_first_token": 242.0,
+      "absmax_incl_first_token": 242.0,
+      "top_channel_absmax": [
+        242.0,
+        214.0,
+        183.0
+      ],
+      "channel_absmax_max_over_median": 11.733333587646484,
+      "channel_rms_max_over_median": 113.50093841552734,
+      "fp8_block_scale_underflow_frac": 0.0,
+      "fp8_block_scale_subnormal_frac": 4.2815652705030516e-05,
+      "sic_damp_over_median_diag": 0.05159749090671539
+    }
+  }
+}

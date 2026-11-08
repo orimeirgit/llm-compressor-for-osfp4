@@ -12,6 +12,10 @@ Calibrates four OSFP4 checkpoints of `allenai/Olmo-3-7B-Instruct` (revision `6e5
 
 The harness needs this branch's Olmo-3 fix (shared runtime transforms for q/k/v and gate/up) and `compressed-tensors-for-osfp4` at `30d017e` (branch `osfp4-diagonal-transform`). Task variants, batch sizes, caps and sampling settings are in `benchmark_protocol.json`.
 
+## Status
+
+Paused on 2026-11-08 after 7 of 42 evaluation stages, to move to a faster GPU. Results so far and the Olmo-3 implementation findings are in `results/RESULTS.md`. Steps to continue on another machine are in `results/RESUME_ON_NEW_GPU.md`.
+
 ## Expected layout
 
 Paths are hard-coded. Put this directory at `/workspace/osfp4-olmo3-harness`, by copying or symlinking.

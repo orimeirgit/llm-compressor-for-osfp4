@@ -1,0 +1,29 @@
+{
+  "score": 0.44107744107744107,
+  "per_seed": {
+    "0": 0.45454545454545453,
+    "1": 0.41919191919191917,
+    "2": 0.4494949494949495
+  },
+  "std_across_seeds": 0.015612152349319373,
+  "n_items": 198,
+  "n_seeds": 3,
+  "task": "gpqa_diamond",
+  "model_path": "/workspace/osfp4-cache/hub/models--allenai--Olmo-3-7B-Instruct/snapshots/6e5971d9eba42665f5bd5a0fcf047f299ce1dccc",
+  "transforms_loaded": 0,
+  "generation": {
+    "max_new_tokens": 8192,
+    "eos_token_id": [
+      100265,
+      100257
+    ],
+    "do_sample": true,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 64
+  },
+  "prompts_sha256": "aef7bc96a05fcf55c236d9660fa91b7646c1c9908099baf6dc37883e230917e4",
+  "limit": null,
+  "cap_hits": 19,
+  "mean_response_tokens": 1831.6616161616162
+}

@@ -1,0 +1,14 @@
+method,task,score_pct,delta_pp_vs_bf16,cap_hits
+bf16,mmlu_cot,66.216,0.0,206
+bf16,gsm8k,90.371,0.0,38
+bf16,hellaswag,75.981,0.0,
+bf16,winogrande,65.825,0.0,
+bf16,arc_challenge,54.01,0.0,
+bf16,gpqa_diamond,44.108,0.0,19
+bf16,wikitext2_ppl,14.006394255307663,,
+osfp4_rtn_w4a16,mmlu_cot,66.422,0.207,245
+osfp4_rtn_w4a16,gsm8k,90.826,0.455,26
+osfp4_rtn_w4a16,wikitext2_ppl,14.00285765593894,,
+osfp4_sic_w4a16,wikitext2_ppl,,,
+osfp4_rtn_w4a4,wikitext2_ppl,,,
+osfp4_sic_w4a4,wikitext2_ppl,,,

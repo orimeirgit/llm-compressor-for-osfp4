@@ -1,0 +1,21 @@
+{
+  "task": "mmlu_cot",
+  "lmeval_task": "mmlu_cot_llama",
+  "metric": "exact_match,strict_match",
+  "score": 0.6642216208517305,
+  "gen_kwargs": "until=<|im_end|>,max_gen_toks=1024,do_sample=False",
+  "model_path": "/workspace/osfp4-runs/olmo3-7b-instruct/checkpoints/nvfp4a16-rtn",
+  "transforms_loaded": 224,
+  "limit": null,
+  "n_samples": 14042,
+  "config": {
+    "runner": "lmeval",
+    "lmeval_task": "mmlu_cot_llama",
+    "metric": "exact_match,strict_match",
+    "batch_size": 16,
+    "chat": true,
+    "num_fewshot": 0,
+    "max_gen_toks": 1024
+  },
+  "cap_hits": 245
+}

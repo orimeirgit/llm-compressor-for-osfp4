@@ -1,0 +1,22 @@
+{
+  "task": "gsm8k",
+  "lmeval_task": "gsm8k_cot_llama",
+  "metric": "exact_match,strict-match",
+  "score": 0.9082638362395754,
+  "gen_kwargs": "until=<|im_end|>,max_gen_toks=1024,do_sample=False",
+  "model_path": "/workspace/osfp4-runs/olmo3-7b-instruct/checkpoints/nvfp4a16-rtn",
+  "transforms_loaded": 224,
+  "limit": null,
+  "n_samples": 2638,
+  "config": {
+    "runner": "lmeval",
+    "lmeval_task": "gsm8k_cot_llama",
+    "metric": "exact_match,strict-match",
+    "batch_size": 16,
+    "chat": true,
+    "fewshot_as_multiturn": true,
+    "num_fewshot": 8,
+    "max_gen_toks": 1024
+  },
+  "cap_hits": 26
+}

@@ -1,0 +1,76 @@
+{
+  "status": "passed",
+  "model": "/workspace/osfp4-cache/hub/models--allenai--Olmo-3-7B-Instruct/snapshots/6e5971d9eba42665f5bd5a0fcf047f299ce1dccc",
+  "revision": "6e5971d9eba42665f5bd5a0fcf047f299ce1dccc",
+  "scheme": "NVFP4",
+  "optimization_mode": "rtn",
+  "modifier": {
+    "config_groups": null,
+    "targets": [
+      "Linear"
+    ],
+    "ignore": [
+      "lm_head"
+    ],
+    "scheme": "NVFP4",
+    "kv_cache_scheme": null,
+    "weight_observer": null,
+    "input_observer": null,
+    "output_observer": null,
+    "observer": null,
+    "bypass_divisibility_checks": false,
+    "requires_calibration_data": true,
+    "index": null,
+    "group": null,
+    "start": null,
+    "end": null,
+    "update": null,
+    "initialized_": true,
+    "finalized_": true,
+    "started_": true,
+    "ended_": true,
+    "optimization_mode": "rtn",
+    "steps": 80,
+    "lr": 0.12,
+    "dampening_frac": 0.01,
+    "offload_hessians": false,
+    "activation_subsample_size": "auto"
+  },
+  "calibration": {
+    "dataset": "HuggingFaceH4/ultrachat_200k",
+    "split": "train_sft",
+    "shuffle_seed": 42,
+    "num_samples": 512,
+    "max_seq_length": 2048,
+    "tokens": 589423,
+    "chat_template": true,
+    "add_special_tokens": false
+  },
+  "pipeline": {
+    "name": "sequential",
+    "sequential_targets": [
+      "Olmo3DecoderLayer"
+    ]
+  },
+  "quantized_layers": 224,
+  "runtime_transform_layers": 224,
+  "reload_parity": {
+    "checked_tensors": 896,
+    "transforms_loaded": 224,
+    "mismatches": []
+  },
+  "runtime": {
+    "repo": "/workspace/llm-compressor-olmo3",
+    "branch": "osfp4-olmo3-shared-runtime",
+    "commit": "6a650621ac86842a3d8c08bb76b9350ebb5112d5",
+    "uncommitted_diff_sha256": "6f695c55fe745b65227fe108faf7ff843b536bb0344354f8ae540cfd7f3820db",
+    "torch": "2.14.1+cu132",
+    "transformers": "5.21.0",
+    "compressed_tensors": "0.20.2a3+osfp4.30d017e"
+  },
+  "seconds": {
+    "calibration": 378.3,
+    "total": 404.1
+  },
+  "activation_subsampling_records": 128
+}
