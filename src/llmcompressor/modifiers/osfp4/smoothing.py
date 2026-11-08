@@ -29,7 +29,7 @@ def deploy_mapping_smooth_quant_scale(
     scale = scale.reshape(-1).to(device=balance_layers[0].weight.device)
 
     if mapping.requires_runtime_smoothing:
-        return _deploy_runtime_smoothing(balance_layers[0], scale)
+        return _deploy_runtime_smoothing(balance_layers, scale)
 
     return _deploy_smooth_layer_smoothing(mapping.smooth_layer, balance_layers, scale)
 
@@ -63,16 +63,22 @@ def _deploy_smooth_layer_smoothing(
     return deployed_scale
 
 
-def _deploy_runtime_smoothing(layer: Linear, scale: torch.Tensor) -> torch.Tensor:
-    """Store the BF16 scale in smooth_quant_input.weight and return its FP32 values."""
-    deployed_scale = scale.detach().float().to(torch.bfloat16)
-    transform = getattr(layer, TRANSFORM_MODULE)
-    transform.set_scale(deployed_scale)
-    weight = layer.weight.detach().clone()
-    weight /= deployed_scale.to(weight).view(1, -1)
-    update_offload_parameter(layer, "weight", weight)
+def _deploy_runtime_smoothing(
+    balance_layers: tuple[Linear, ...], scale: torch.Tensor
+) -> torch.Tensor:
+    """Store one BF16 scale in every balance layer's smooth_quant_input.weight.
 
-    return transform.weight.detach().float()
+    Layers in a runtime mapping read the same input, so each receives an identical
+    transform. Return the stored FP32 values.
+    """
+    deployed_scale = scale.detach().float().to(torch.bfloat16)
+    for layer in balance_layers:
+        getattr(layer, TRANSFORM_MODULE).set_scale(deployed_scale)
+        weight = layer.weight.detach().clone()
+        weight /= deployed_scale.to(weight).view(1, -1)
+        update_offload_parameter(layer, "weight", weight)
+
+    return getattr(balance_layers[0], TRANSFORM_MODULE).weight.detach().float()
 
 
 def update_smoothed_input_global_scale(

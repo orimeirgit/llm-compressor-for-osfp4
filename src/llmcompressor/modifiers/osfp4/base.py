@@ -52,10 +52,34 @@ __all__ = ["OSFP4Mapping", "OSFP4Modifier"]
 
 _OSFP4_OBSERVER = "osfp4"
 
+# Post-norm decoders (Olmo2/Olmo3) normalize each sublayer's *output* before the
+# residual add, so no norm feeds q/k/v or gate/up: those projections read the raw
+# residual stream. The SmoothQuant default fallback would fold the MLP scale into
+# post_attention_layernorm, which scales only the attention branch and not the
+# residual, silently breaking the model. Instead, each group of projections that
+# reads one shared input gets one shared runtime input transform. This keeps the
+# same joint optimization units as pre-norm models (q/k/v and gate/up share one
+# alpha), and every shard of a fused qkv/gate_up kernel carries identical scales.
+_SHARED_INPUT_RUNTIME_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
+    architecture: (
+        (
+            "re:.*self_attn\\.q_proj$",
+            "re:.*self_attn\\.k_proj$",
+            "re:.*self_attn\\.v_proj$",
+        ),
+        ("re:.*mlp\\.gate_proj$", "re:.*mlp\\.up_proj$"),
+    )
+    for architecture in ("Olmo2ForCausalLM", "Olmo3ForCausalLM")
+}
+
 
 @dataclass(frozen=True, slots=True)
 class OSFP4Mapping:
-    """One complete alpha optimization and SmoothQuant deployment unit."""
+    """One complete alpha optimization and SmoothQuant deployment unit.
+
+    A mapping without a smooth layer deploys its scale as a runtime input
+    transform on every balance layer; all of them must read the same input.
+    """
 
     mapping_name: str
     smooth_layer: Module | None
@@ -215,12 +239,14 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         # State may contain a deep copy; count the loader the pipeline will consume.
         self._calibration_dataloader = kwargs.get("calib_data", state.data.calib)
         self._calibration_cache.offload_hessians = self.offload_hessians
+        module_names = get_module_to_name_dict(state.model)
         initialize_diagonal_smoothing(
             state.model,
             [
-                mapping.mapping_name
+                module_names[layer]
                 for mapping in self._resolved_mappings
                 if mapping.requires_runtime_smoothing
+                for layer in mapping.balance_layers
             ],
         )
         QuantizationMixin.initialize_quantization(self, state.model)
@@ -288,10 +314,21 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
             )
         selected_balance_layers = {layer for _, layer in selected}
         module_names = get_module_to_name_dict(model)
-        mappings = self._resolve_smooth_layer_mappings(
-            model, selected_balance_layers, module_names
+        architecture = model.__class__.__name__
+        if architecture in _SHARED_INPUT_RUNTIME_GROUPS:
+            mappings = self._resolve_shared_input_runtime_mappings(
+                model,
+                _SHARED_INPUT_RUNTIME_GROUPS[architecture],
+                selected_balance_layers,
+                module_names,
+            )
+        else:
+            mappings = self._resolve_smooth_layer_mappings(
+                model, selected_balance_layers, module_names
+            )
+        smooth_layer_count = sum(
+            not mapping.requires_runtime_smoothing for mapping in mappings
         )
-        smooth_layer_count = len(mappings)
         covered = {layer for mapping in mappings for layer in mapping.balance_layers}
         mappings.extend(
             OSFP4Mapping(
@@ -303,11 +340,42 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
             if layer not in covered
         )
         logger.info(
-            f"Resolved OSFP4 architecture {model.__class__.__name__}: "
+            f"Resolved OSFP4 architecture {architecture}: "
             f"{smooth_layer_count} smooth-layer mappings and "
             f"{len(mappings) - smooth_layer_count} "
             "runtime mappings"
         )
+        return mappings
+
+    def _resolve_shared_input_runtime_mappings(
+        self,
+        model: Module,
+        groups: tuple[tuple[str, ...], ...],
+        selected_balance_layers: set[Module],
+        module_names: dict[Module, str],
+    ) -> list[OSFP4Mapping]:
+        """Build one runtime mapping per set of fully selected layers sharing an input.
+
+        Partially selected sets are left to the per-layer runtime fallback.
+        """
+        mappings = []
+        for group in groups:
+            for matched in match_modules_set(model, group):
+                balance_layers = tuple(tree_leaves(matched))
+                if not set(balance_layers) <= selected_balance_layers:
+                    continue
+                if len({layer.in_features for layer in balance_layers}) != 1:
+                    raise ValueError(
+                        "OSFP4 shared-input runtime group has mixed input widths: "
+                        f"{[module_names[layer] for layer in balance_layers]}"
+                    )
+                mappings.append(
+                    OSFP4Mapping(
+                        mapping_name=module_names[balance_layers[0]],
+                        smooth_layer=None,
+                        balance_layers=balance_layers,
+                    )
+                )
         return mappings
 
     def _resolve_smooth_layer_mappings(
