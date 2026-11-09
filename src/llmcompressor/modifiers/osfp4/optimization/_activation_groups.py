@@ -34,9 +34,11 @@ def assemble_activation_quantization_groups(
 
     token_start = 0
     for batch in cached_activation_batches:
+        # Transfer in the cached dtype; copy_ widens to FP32 while permuting, so no
+        # full-size FP32 temporary is created next to X_blocks.
         X_batch = batch.detach().to(
             device=device,
-            dtype=torch.float32,
+            dtype=batch.dtype,
             non_blocking=(
                 batch.device.type == "cpu"
                 and device.type == "cuda"

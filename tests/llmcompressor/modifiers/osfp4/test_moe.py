@@ -633,3 +633,84 @@ def test_routed_expert_reservoir_preserves_input_scale(
     finally:
         modifier.remove_hooks()
         cache.clear_all()
+
+
+@pytest.mark.parametrize("all_tokens", [False, True])
+@pytest.mark.parametrize("scheme", ["NVFP4", "NVFP4A16"])
+@pytest.mark.parametrize("mode", ["rtn", "sic"])
+def test_expert_quantization_is_chunk_size_invariant(
+    all_tokens, scheme, mode, monkeypatch
+):
+    from llmcompressor.observers.osfp4 import observer, scale_optimization
+
+    # Exercise the large-problem FP64 path with a small real MoE model on CPU.
+    monkeypatch.setattr(scale_optimization, "_MIN_SPLIT_BYTES", 0)
+    monkeypatch.setattr(sequential, "get_main_device", lambda: torch.device("cpu"))
+    optimized_experts = []
+    original_deploy = OSFP4Modifier._deploy_mapping
+
+    def record_deploy(self, mapping, result):
+        if mapping.is_expert:
+            optimized_experts.append(mapping.mapping_name)
+        return original_deploy(self, mapping, result)
+
+    monkeypatch.setattr(OSFP4Modifier, "_deploy_mapping", record_deploy)
+
+    def quantize(chunked):
+        optimized_experts.clear()
+        chunk_sizes = []
+
+        def select_chunk(m, k, num_blocks):
+            assert scale_optimization.uses_exact_alpha_reduction(m, k, num_blocks)
+            size = 1 if chunked else num_blocks
+            chunk_sizes.append((size, num_blocks))
+            return size
+
+        monkeypatch.setattr(observer, "select_blocks_per_chunk", select_chunk)
+        model = make_model()
+        modifier = make_modifier(
+            scheme=scheme, optimization_mode=mode, activation_subsample_size=8
+        )
+        loader = torch.utils.data.DataLoader(
+            [{"input_ids": torch.randint(0, 64, (1, 16))} for _ in range(4)],
+            batch_size=None,
+        )
+        context = moe_calibration_context() if all_tokens else contextlib.nullcontext()
+        with context, create_session() as session:
+            session.initialize(
+                model=model,
+                recipe=[modifier],
+                start=-1,
+                calib_data=loader,
+                sequential_targets=["Qwen3MoeDecoderLayer"],
+            )
+            pipeline = CalibrationPipeline.from_modifiers(
+                session.lifecycle.recipe.modifiers
+            )
+            pipeline(
+                model,
+                loader,
+                DatasetArguments(
+                    sequential_targets=["Qwen3MoeDecoderLayer"],
+                    sequential_offload_device="cpu",
+                    propagate_error=True,
+                    moe_calibrate_all_experts=all_tokens,
+                ),
+            )
+            session.finalize()
+        assert len(optimized_experts) == 8  # Gate/up and down for all four experts.
+        assert chunk_sizes and all(total > 1 for _, total in chunk_sizes)
+        assert all(size == (1 if chunked else total) for size, total in chunk_sizes)
+        with torch.no_grad():
+            logits = model(input_ids=torch.arange(16).reshape(1, -1)).logits.clone()
+        assert torch.isfinite(logits).all()
+        return {
+            name: value.clone() for name, value in model.state_dict().items()
+        }, logits
+
+    expected_state, expected_logits = quantize(chunked=False)
+    actual_state, actual_logits = quantize(chunked=True)
+    assert actual_state.keys() == expected_state.keys()
+    for name in expected_state:
+        assert_bytes(actual_state[name], expected_state[name])
+    assert_bytes(actual_logits, expected_logits)
