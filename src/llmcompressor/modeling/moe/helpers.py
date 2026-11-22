@@ -12,6 +12,13 @@ from transformers import PreTrainedConfig
 from llmcompressor.sentinel import Sentinel
 from llmcompressor.typing import TorchModuleProtocol
 
+NUM_EXPERTS_CONFIG_KEYS = [
+    "num_local_experts",
+    "moe_num_experts",
+    "num_experts",
+    "n_routed_experts",
+]
+
 
 class FusedExpertsProtocol(TorchModuleProtocol):
     config: PreTrainedConfig
@@ -103,33 +110,71 @@ def get_use_experts_implementation_args(experts_cls: type) -> dict[str, bool] | 
     return None
 
 
+# Routers of these models apply an activation that their published configs do
+# not declare, and transformers hard-codes it in the router module itself
+# (Glm4MoeTopkRouter, Glm4vMoeTextTopkRouter, Glm4MoeLiteTopkRouter all call
+# `.sigmoid()`), so the plain softmax default is wrong for them.
+DEFAULT_SCORE_FUNCTION_BY_MODEL_TYPE = {
+    "glm4_moe": "sigmoid",
+    "glm4_moe_lite": "sigmoid",
+    # glm4v_moe is the multimodal wrapper; its MoE lives in the text model,
+    # whose config is what get_text_config() returns and what the modifiers use.
+    # Both are listed so a caller holding either object resolves the same way.
+    "glm4v_moe": "sigmoid",
+    "glm4v_moe_text": "sigmoid",
+}
+
+
 @dataclass
 class MoEConfig:
+    # experts routing
     num_experts: int
     num_experts_per_tok: int
+
+    # router scoring
+    score_function: str
+
+    # group-limited routing
+    n_group: int | None
+    top_k_group: int | None
+    group_size: int | None
+
+    # hidden sizes
     hidden_dim: int
     intermediate_size: int
+
+    # biases and activations
     use_bias: bool
     hidden_act: str
+
+    # moe extras
     limit: float
     alpha: float | None
+
+    # weight dtypes
     dtype: torch.dtype
 
     @classmethod
     def from_config(cls, config: PreTrainedConfig):
-        ret = cls(
-            num_experts=_getattr_fallbacks(
-                config,
-                [
-                    "num_local_experts",
-                    "moe_num_experts",
-                    "num_experts",
-                    "n_routed_experts",
-                ],
-            ),
+        # special case: qwen3_5_moe does not specify scoring func in config
+        if config.model_type == "qwen3_5_moe_text":
+            config.scoring_func = "softmax"
+
+        self = cls(
+            num_experts=_getattr_fallbacks(config, NUM_EXPERTS_CONFIG_KEYS),
             num_experts_per_tok=_getattr_fallbacks(
-                config, ["top_k_experts", "num_experts_per_tok"]
+                config,
+                ["top_k_experts", "num_experts_per_tok", "num_experts_per_token"],
             ),
+            score_function=_getattr_fallbacks(
+                config,
+                ["scoring_func", "score_func", "moe_router_activation_func"],
+                DEFAULT_SCORE_FUNCTION_BY_MODEL_TYPE.get(config.model_type, "softmax"),
+                warn_on_default=True,
+            ),
+            n_group=_getattr_fallbacks(config, ["n_group"], None),
+            top_k_group=_getattr_fallbacks(config, ["topk_group", "top_k_group"], None),
+            group_size=None,
             hidden_dim=_getattr_fallbacks(
                 config, ["moe_latent_size", "hidden_size", "hidden_dim"]
             ),
@@ -146,20 +191,35 @@ class MoEConfig:
             dtype=_getattr_fallbacks(config, ["dtype"]),
         )
 
+        # compute group_size
+        if self.n_group is not None:
+            if self.num_experts % self.n_group != 0:
+                raise ValueError(
+                    f"Group limited router detected, but {self.num_experts} experts "
+                    f"not divisible by n_group={self.n_group}"
+                )
+            self.group_size = self.num_experts // self.n_group
+
         # special case: some configs have parameters which are not marked in config
         match config.model_type:
             case "gpt_oss" | "openai_privacy_filter":
-                ret.use_bias = True
-                ret.limit = 7.0
-                ret.alpha = 1.702
-                ret.hidden_act = "sigmoid"
+                self.use_bias = True
+                self.limit = 7.0
+                self.alpha = 1.702
+                self.hidden_act = "sigmoid"
             case "lfm2_moe":
-                ret.hidden_act = "silu"
+                self.hidden_act = "silu"
             case "nemotron_h":
                 if config.moe_latent_size is None:
-                    ret.hidden_dim = config.hidden_size
+                    self.hidden_dim = config.hidden_size
+            case "kimi_k3" | "kimi_linear":
+                # latent MoE: experts run at routed_expert_hidden_size, which is
+                # both their input and output width, rather than at the model
+                # hidden size
+                if getattr(config, "routed_expert_hidden_size", None) is not None:
+                    self.hidden_dim = config.routed_expert_hidden_size
 
-        return ret
+        return self
 
 
 def import_or_none(paths: str | list[str]) -> object | None:
@@ -178,13 +238,22 @@ def import_or_none(paths: str | list[str]) -> object | None:
 
 
 def _getattr_fallbacks(
-    target: object, attrs: list[str], default: Any = Sentinel("None")
+    target: object,
+    attrs: list[str],
+    default: Any = Sentinel("None"),
+    warn_on_default: bool = False,
 ) -> Any:
     for attr in attrs:
         if hasattr(target, attr):
             return getattr(target, attr)
 
     if default is not Sentinel("None"):
+        if warn_on_default:
+            logger.warning(
+                f"{target.__class__.__name__} does not have any of {attrs} attributes. "
+                f"Defaulting to {default}",
+                log_once=True,
+            )
         return default
 
     raise AttributeError(f"{target} does not have any of {attrs} attributes")
