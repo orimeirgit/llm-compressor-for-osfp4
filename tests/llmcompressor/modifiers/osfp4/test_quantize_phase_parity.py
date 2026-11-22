@@ -14,7 +14,7 @@ from safetensors.torch import load_file
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from llmcompressor.args import DatasetArguments
-from llmcompressor.core import create_session
+from llmcompressor.core import State, create_session
 from llmcompressor.modifiers.osfp4 import OSFP4Modifier, base, osfp4_quantize
 from llmcompressor.modifiers.osfp4.base import OSFP4Mapping
 from llmcompressor.modifiers.osfp4.calibration_cache import OSFP4CalibrationCache
@@ -107,7 +107,7 @@ def test_mapping_phases_match_reference_bytes(
             optimization_mode=optimization_mode,
             steps=2,
         )
-        modifier.initialize_quantization(model)
+        modifier.initialize_quantization(State(model=model))
         if layout == "runtime":
             initialize_diagonal_smoothing(model, ["layers.0"])
         modifier.start_calibration(model)

@@ -44,7 +44,7 @@ def _prepared_layer(optimization_mode, dtype=torch.float32, weight_only=False):
         steps=0,
         lr=0.01,
     )
-    modifier.initialize_quantization(model)
+    modifier.initialize_quantization(State(model=model))
     initialize_diagonal_smoothing(model, ["layer"])
     modifier.start_calibration(model)
     return model, layer
@@ -211,7 +211,7 @@ def test_mapping_phases_return_fused_row_slices(monkeypatch, optimization_mode):
         optimization_mode=optimization_mode,
         steps=0,
     )
-    modifier.initialize_quantization(model)
+    modifier.initialize_quantization(State(model=model))
     modifier.start_calibration(model)
     mapping = OSFP4Mapping("mapping", torch.nn.LayerNorm(16), layers)
     weight_scale = torch.arange(5, dtype=torch.float32).reshape(5, 1) + 0.5
