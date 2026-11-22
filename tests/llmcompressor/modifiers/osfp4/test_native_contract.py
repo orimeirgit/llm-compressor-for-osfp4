@@ -108,7 +108,7 @@ def test_invalid_options_rejected(kwargs):
 @pytest.mark.parametrize("scheme", ["W4A16", "FP8", "MXFP4"])
 def test_other_schemes_rejected(scheme):
     with pytest.raises(ValueError, match="only NVFP4"):
-        _ = OSFP4Modifier(scheme=scheme).resolved_config
+        _ = OSFP4Modifier(scheme=scheme).resolve_quantization_config()
 
 
 @pytest.mark.parametrize("scheme", ["NVFP4", "NVFP4A16"])
@@ -139,26 +139,28 @@ def test_observer_configuration_survives_recipe_reload_and_repeated_resolution(
         steps=3,
         lr=0.03,
     )
-    expected = modifier.resolved_config.model_dump(mode="json")
+    expected = modifier.resolve_quantization_config().model_dump(mode="json")
 
     # Resolving the config must not create conflicting recipe observer options.
     serialized_recipe = Recipe.from_modifiers(modifier).yaml()
     restored = Recipe.create_instance(serialized_recipe).modifiers[0]
-    assert restored.resolved_config.model_dump(mode="json") == expected
+    assert restored.resolve_quantization_config().model_dump(mode="json") == expected
 
     for candidate in (modifier, restored):
-        assert (
-            candidate.resolve_quantization_config().model_dump(mode="json") == expected
-        )
+        for has_calibration_data in (False, True):
+            resolved = candidate.resolve_quantization_config(
+                has_calibration_data=has_calibration_data
+            )
+            assert resolved.model_dump(mode="json") == expected
+            for group in resolved.config_groups.values():
+                assert group.weights.observer == "osfp4"
+                assert group.weights.observer_kwargs == {
+                    "mode": optimization_mode,
+                    "num_iters": 3,
+                    "lr": 0.03,
+                }
         assert candidate.weight_observer == observer_options.get("weight_observer")
         assert candidate.observer == observer_options.get("observer")
-        for group in candidate.resolved_config.config_groups.values():
-            assert group.weights.observer == "osfp4"
-            assert group.weights.observer_kwargs == {
-                "mode": optimization_mode,
-                "num_iters": 3,
-                "lr": 0.03,
-            }
 
 
 def test_distributed_guard(monkeypatch):

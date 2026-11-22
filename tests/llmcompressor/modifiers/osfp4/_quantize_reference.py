@@ -201,11 +201,15 @@ class PreRefactorOSFP4Modifier(base.OSFP4Modifier):
                 if m.requires_runtime_smoothing
             ],
         )
-        base.QuantizationMixin.initialize_quantization(self, state.model)
+        base.QuantizationMixin.initialize_quantization(self, state)
         return True
 
-    def resolve_quantization_config(self) -> base.QuantizationConfig:
-        config = base.QuantizationMixin.resolve_quantization_config(self)
+    def resolve_quantization_config(
+        self, has_calibration_data: bool = False
+    ) -> base.QuantizationConfig:
+        config = base.QuantizationMixin.resolve_quantization_config(
+            self, has_calibration_data=has_calibration_data
+        )
         observer_kwargs = {
             "mode": self.optimization_mode,
             "num_iters": self.steps,
