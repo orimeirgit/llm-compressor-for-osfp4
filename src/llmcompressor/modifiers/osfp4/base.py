@@ -145,11 +145,21 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
             raise ValueError("activation_subsample_size must be positive")
         return value
 
-    def resolve_quantization_config(self) -> QuantizationConfig:
+    def _default_weight_observer(
+        self, has_calibration_data: bool, scheme
+    ) -> str:
+        """Always default OSFP4 weight observers to the OSFP4 observer."""
+        return _OSFP4_OBSERVER
+
+    def resolve_quantization_config(
+        self, has_calibration_data: bool = False
+    ) -> QuantizationConfig:
         """Validate NVFP4/NVFP4A16 groups, configure OSFP4 weight observers, and disable
         activation subsampling for weight-only calibration.
         """
-        config = QuantizationMixin.resolve_quantization_config(self)
+        config = QuantizationMixin.resolve_quantization_config(
+            self, has_calibration_data=has_calibration_data
+        )
         observer_kwargs = {
             "mode": self.optimization_mode,
             "num_iters": self.steps,
@@ -197,7 +207,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
         """Return weight-target selectors from all resolved quantization groups."""
         return {
             target
-            for group in self.resolved_config.config_groups.values()
+            for group in self.resolve_quantization_config().config_groups.values()
             for target in group.targets
         }
 
@@ -223,7 +233,7 @@ class OSFP4Modifier(Modifier, QuantizationMixin):
                 if mapping.requires_runtime_smoothing
             ],
         )
-        QuantizationMixin.initialize_quantization(self, state.model)
+        QuantizationMixin.initialize_quantization(self, state)
         return True
 
     def _validate_initialization(self, state: State, **kwargs) -> None:
