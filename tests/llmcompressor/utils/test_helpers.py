@@ -1,6 +1,11 @@
 import pytest
 import torch
 from compressed_tensors.offload import dispatch_model, set_onload_device
+from compressed_tensors.offload.module import (
+    subgraph_offload_modules,
+    subgraph_onload_modules,
+    subgraph_stage_modules,
+)
 from transformers import (
     AutoModelForCausalLM,
     MllamaForConditionalGeneration,
@@ -11,6 +16,7 @@ from llmcompressor.utils import (
     calibration_forward_context,
     disable_cache,
     disable_lm_head,
+    values_by_decoder_layer,
 )
 from llmcompressor.utils.dev import skip_weights_download
 from tests.testing_utils import requires_gpu, requires_hf_token
@@ -22,6 +28,45 @@ def test_DisableQuantization():
     with DisableQuantization(model):
         assert not model.quantization_enabled
     assert model.quantization_enabled
+
+
+@pytest.mark.unit
+def test_values_by_decoder_layer():
+    """Values are positioned at their name's decoder layer index, with
+    ``None`` at every other index, ordered by layer rather than by name."""
+    values = {
+        "model.layers.10.mlp.experts": 2,
+        "model.layers.2.mlp.experts": 4,
+    }
+    assert values_by_decoder_layer(values, num_layers=11) == (
+        [None, None, 4] + [None] * 7 + [2]
+    )
+
+
+@pytest.mark.unit
+def test_values_by_decoder_layer_without_num_layers():
+    """Without ``num_layers`` the list is sized to cover the largest decoder
+    layer index parsed from the names, so trailing decoder layers are not
+    represented."""
+    values = {
+        "model.layers.0.mlp.experts": 4,
+        "model.layers.2.mlp.experts": 2,
+    }
+    assert values_by_decoder_layer(values) == [4, None, 2]
+    assert values_by_decoder_layer({}) == []
+
+
+@pytest.mark.unit
+def test_values_by_decoder_layer_rejects_bad_names():
+    with pytest.raises(ValueError, match="decoder layer index"):
+        values_by_decoder_layer({"model.decoder.0.mlp.experts": 4}, num_layers=1)
+    with pytest.raises(ValueError, match="out of"):
+        values_by_decoder_layer({"model.layers.1.mlp.experts": 4}, num_layers=1)
+    with pytest.raises(ValueError, match="cannot be positioned"):
+        values_by_decoder_layer(
+            {"vision.layers.0.experts": 4, "model.layers.0.mlp.experts": 2},
+            num_layers=1,
+        )
 
 
 @pytest.mark.unit
@@ -85,6 +130,29 @@ def test_disable_lm_head_does_not_onload_weight(monkeypatch):
         pass
 
     assert onloaded == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("stage", [True, False])
+def test_disable_lm_head_survives_subgraph_onload(stage):
+    # the sequential pipeline onloads and offloads each subgraph's modules within
+    # calibration_forward_context
+    with skip_weights_download():
+        model = AutoModelForCausalLM.from_pretrained("nm-testing/tinysmokeqwen3")
+    set_onload_device(model, "cpu")
+    modules = {"lm_head": model.lm_head}
+    hidden_states = torch.zeros(1, 4, model.config.hidden_size)
+
+    with disable_lm_head(model):
+        if stage:
+            subgraph_stage_modules(modules)
+        offload_kwargs = subgraph_onload_modules(modules)
+        assert model.lm_head(hidden_states).device == torch.device("meta")
+
+        subgraph_offload_modules(modules, offload_kwargs)
+        assert model.lm_head(hidden_states).device == torch.device("meta")
+
+    assert model.lm_head(hidden_states).device == torch.device("cpu")
 
 
 @requires_gpu
