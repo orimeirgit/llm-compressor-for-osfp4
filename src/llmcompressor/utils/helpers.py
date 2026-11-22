@@ -6,10 +6,10 @@ Common functions for interfacing with python primitives and directories/files.
 import contextlib
 import importlib
 import re
-from typing import Any
+from typing import Any, Callable, Iterable, Mapping, TypeVar
 
 import torch
-from compressed_tensors.offload import disable_onloading
+from compressed_tensors.offload import disable_onloading, unwrap_offload_forward
 from compressed_tensors.quantization import disable_quantization, enable_quantization
 from compressed_tensors.utils import patch_attr
 from loguru import logger
@@ -26,10 +26,19 @@ __all__ = [
     "disable_hf_kernels",
     "calibration_forward_context",
     "disable_lm_head",
+    "numeric_sorted_names",
+    "values_by_decoder_layer",
+    "hasattr_fallbacks",
     "getattr_fallbacks",
     "hasitem_fallbacks",
     "getitem_fallbacks",
 ]
+
+_T = TypeVar("_T")
+
+# module names of decoder layers follow the `layers.N` convention, e.g.
+# `model.layers.12.mlp.experts`
+_DECODER_LAYER_PATTERN = re.compile(r"layers\.(\d+)")
 
 
 def import_from_path(path: str) -> str:
@@ -163,6 +172,34 @@ def use_eager_attention(model: torch.nn.Module):
 
 
 @contextlib.contextmanager
+def _patch_forward(module: torch.nn.Module, forward: Callable):
+    """
+    Patch the forward of a module, including the forward wrapped by offloading.
+    Onloading an offloaded module, as the sequential pipeline does for each subgraph,
+    restores the forward that offloading wrapped, so patching only `module.forward`
+    would be undone. The original forward is restored upon exit
+
+    Exit restores the forward that was set on entry, so patches of the same module
+    must be exited in reverse order of entry (as nested `with` blocks do). A patch
+    still applied on top at exit is discarded
+
+    :param module: module whose forward to patch
+    :param forward: bound method which replaces the module's forward
+    """
+    with unwrap_offload_forward(module):
+        original = vars(module).get("forward")
+        module.forward = forward
+    try:
+        yield
+    finally:
+        with unwrap_offload_forward(module):
+            if original is None:
+                del module.forward
+            else:
+                module.forward = original
+
+
+@contextlib.contextmanager
 def disable_lm_head(model: torch.nn.Module):
     """
     Disable the lm_head of a model by moving it to the meta device. This function
@@ -193,12 +230,118 @@ def disable_lm_head(model: torch.nn.Module):
 
         with contextlib.ExitStack() as stack:
             lm_head_forward = dummy_forward.__get__(lm_head)
-            stack.enter_context(patch_attr(lm_head, "forward", lm_head_forward))
+            stack.enter_context(_patch_forward(lm_head, lm_head_forward))
 
             if hasattr(model, "_hf_hook"):
                 stack.enter_context(patch_attr(model._hf_hook, "io_same_device", False))
 
             yield
+
+
+def numeric_sorted_names(names: Iterable[str]) -> list[str]:
+    """
+    Sort names by their numeric components, so that e.g. `layers.10` sorts
+    after `layers.2` rather than before it (as a plain lexicographic sort
+    would do).
+
+    MoE layer names must be ordered like the model's layers, since per-layer
+    lists (saliency reports, expert-sparsity configs) are matched positionally
+    against the model's layer order.
+
+    :param names: an iterable of names, or a mapping keyed by name
+    :return: the names in numeric order
+    """
+
+    def sort_key(name: str) -> tuple:
+        # split into digit and non-digit runs, comparing digit runs as
+        # integers; each run is tagged so that ints never compare against
+        # strings (which would raise a TypeError)
+        return tuple(
+            (0, int(run), "") if run.isdigit() else (1, 0, run)
+            for run in re.split(r"(\d+)", name)
+        )
+
+    return sorted(names, key=sort_key)
+
+
+def values_by_decoder_layer(
+    values: Mapping[str, _T],
+    num_layers: int | None = None,
+) -> list[_T | None]:
+    """
+    Position values keyed by module name onto a per-decoder-layer list.
+
+    Each name is matched against ``layers.(\\d+)`` to find the decoder layer
+    its module belongs to, and its value is placed at that index of the
+    returned list; every other index holds ``None`` (e.g. for dense layers).
+    The result is matched positionally against the model's layer order, as
+    required by per-layer checkpoint fields such as
+    ``ExpertSparsityConfig.num_experts``.
+
+    :param values: mapping from module name to that layer's value, where a
+        value of ``None`` marks a layer which was tracked but not modified
+    :param num_layers: total number of decoder layers, which sizes the list.
+        When ``None``, the list is instead sized to cover the largest layer
+        index parsed from ``values`` (with a warning), leaving any trailing
+        decoder layers unrepresented
+    :return: a list holding each value at its layer index and ``None``
+        everywhere else
+    :raises ValueError: if a name carries no ``layers.(\\d+)`` component, if a
+        layer index falls outside ``[0, num_layers)``, or if two names map to
+        the same layer index -- which can happen when e.g. a vision tower
+        holds its own MoE layers named ``layers.N``
+    """
+    # parse each name's decoder layer index up front, so that the list can
+    # be sized before values are positioned onto it
+    index_by_name: dict[str, int] = {}
+    for name in numeric_sorted_names(values):
+        match = _DECODER_LAYER_PATTERN.search(name)
+        if match is None:
+            raise ValueError(
+                f"Could not extract a decoder layer index from '{name}'; "
+                "expected a module name containing a 'layers.N' component"
+            )
+        index_by_name[name] = int(match.group(1))
+
+    if num_layers is None:
+        logger.warning(
+            "num_layers is None; sizing the per-layer list from the largest "
+            "decoder layer index parsed from the given module names, so any "
+            "decoder layers beyond it will not be represented in the result"
+        )
+        num_layers = max(index_by_name.values(), default=-1) + 1
+
+    per_layer: list[_T | None] = [None] * num_layers
+    first_name_at: dict[int, str] = {}
+
+    for name, index in index_by_name.items():
+        if not 0 <= index < num_layers:
+            raise ValueError(
+                f"Decoder layer index {index} parsed from '{name}' is out of "
+                f"range for a model with {num_layers} decoder layers"
+            )
+        if index in first_name_at:
+            raise ValueError(
+                f"Modules '{first_name_at[index]}' and '{name}' both map to "
+                f"decoder layer {index}, so their values cannot be positioned "
+                "unambiguously on a per-layer list. This can happen when e.g. "
+                "a vision tower holds its own MoE layers named 'layers.N'"
+            )
+
+        first_name_at[index] = name
+        per_layer[index] = values[name]
+
+    return per_layer
+
+
+def hasattr_fallbacks(
+    target: object, attrs: list[str], return_attr: bool = False
+) -> bool | str:
+    for attr in attrs:
+        if hasattr(target, attr):
+            return attr if return_attr else True
+
+    return False
 
 
 def getattr_fallbacks(
